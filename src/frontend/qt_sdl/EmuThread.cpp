@@ -22,6 +22,8 @@
 #include <string.h>
 
 #include <optional>
+#include <thread>
+#include <chrono>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -37,6 +39,7 @@
 
 #include "Args.h"
 #include "NDS.h"
+#include "ARM.h"
 #include "NDSCart.h"
 #include "GBACart.h"
 #include "GPU.h"
@@ -44,6 +47,8 @@
 #include "Wifi.h"
 #include "Platform.h"
 #include "LocalMP.h"
+#include "MPInterface.h"
+#include "LAN.h"
 #include "Config.h"
 #include "RTC.h"
 #include "DSi.h"
@@ -103,8 +108,277 @@ void EmuThread::detachWindow(MainWindow* window)
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// Scripted test autopilot + RAM telemetry (debug tooling, env-driven).
+//   MELONDS_AP=host|join      enable; pick LAN role
+//   MELONDS_AP_IP=<ip>        join target (default 127.0.0.1)
+// Drives the ROM through boot -> multiplayer activation, runs movement
+// patterns, and logs the game's own view of every player (positions read
+// straight out of emulated main RAM via the ROM's discovery block) to
+// melonds_ap_<role>.csv for offline comparison.  Inert unless the env
+// variable is set.
+// ---------------------------------------------------------------------------
+namespace
+{
+
+int apMode = -2;                // -2 uninit, -1 off, 0 host, 1 join
+const char* apJoinIP = "127.0.0.1";
+melonDS::u32 apFrame = 0;
+melonDS::u32 apConnFrame = 0;   // frame the session connected (0 = not yet)
+melonDS::u32 apDiscBase = 0;    // emu-addr of the ROM discovery block
+FILE* apCsv = nullptr;
+
+melonDS::u32 apRd32(melonDS::NDS* nds, melonDS::u32 addr)
+{
+    return *(melonDS::u32*)&nds->MainRAM[addr & nds->MainRAMMask];
+}
+melonDS::s16 apRd16s(melonDS::NDS* nds, melonDS::u32 addr)
+{
+    return (melonDS::s16)*(melonDS::u16*)&nds->MainRAM[addr & nds->MainRAMMask];
+}
+melonDS::u8 apRd8(melonDS::NDS* nds, melonDS::u32 addr)
+{
+    return nds->MainRAM[addr & nds->MainRAMMask];
+}
+
+static volatile unsigned int g_apLoopSeq = 0;   // emu-loop heartbeat
+
+melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
+{
+    using namespace melonDS;
+    u32 mask = maskIn;
+
+    g_apLoopSeq++;   // RunFrame from the previous iteration returned
+
+    if (apMode == -2)
+    {
+        const char* e = getenv("MELONDS_AP");
+        apMode = (!e) ? -1 : (!strcmp(e, "host")) ? 0 : (!strcmp(e, "join")) ? 1 : -1;
+        const char* ip = getenv("MELONDS_AP_IP");
+        if (ip) apJoinIP = ip;
+    }
+    if (apMode < 0) return mask;
+
+    apFrame++;
+
+    // ---- LAN bring-up ----
+    if (apFrame == ((apMode == 0) ? 240u : 480u))
+    {
+        MPInterface::Set(MPInterface_LAN);
+        MPInterface::Get().SetRecvTimeout(300);
+        MPInterface::Get().SetAsyncMode(true);
+        LAN& lan = (LAN&)MPInterface::Get();
+        bool ok = (apMode == 0) ? lan.StartHost("AP0", 2)
+                                : lan.StartClient("AP1", apJoinIP);
+        printf("[AP] LAN %s -> %d\n", (apMode == 0) ? "host" : "join", ok ? 1 : 0);
+    }
+
+    // ---- input script ----
+    u32 press = 0;
+    if (apFrame >= 700 && apFrame < 2000)
+    {
+        if ((apFrame % 40) < 8) press |= (1 << 0);            // tap A (title/file select)
+    }
+    else if (apFrame >= 2060 && apFrame < 2072)
+    {
+        press |= (1 << 2);                                     // SELECT: wireless menu
+    }
+    else if (apFrame >= 2120 && apFrame < 2128)
+    {
+        press |= (1 << 0);                                     // A: Activate Multiplayer
+    }
+
+    // ---- discovery scan + telemetry ----
+    if (apFrame >= 600 && apDiscBase == 0 && (apFrame % 60) == 0)
+    {
+        for (u32 off = 0; off < 0x400000 - 16; off += 4)
+        {
+            if (*(u32*)&nds->MainRAM[off] == 0xCAFE1234
+                && *(u32*)&nds->MainRAM[off+4] == 0x5678CAFE)
+            {
+                apDiscBase = 0x02000000 + off;
+                printf("[AP] discovery at %08X\n", apDiscBase);
+                break;
+            }
+        }
+    }
+
+    if (apDiscBase)
+    {
+        u32 pOwExp = apRd32(nds, apDiscBase + 14*4);
+        u32 pOwImp = apRd32(nds, apDiscBase + 15*4);
+        u32 pDiag  = apRd32(nds, apDiscBase + 30*4);
+        u8 wmState = pDiag ? apRd8(nds, pDiag + 4) : 0xFF;
+        u8 peerMask = pDiag ? apRd8(nds, pDiag + 7) : 0;
+
+        if (!apConnFrame && peerMask) 
+        {
+            apConnFrame = apFrame;
+            printf("[AP] connected at frame %u\n", apFrame);
+        }
+
+        // movement phases relative to connect.
+        // MELONDS_AP_PATTERN selects the stress pattern:
+        //   (unset)/walk : hold a direction, alternating every 90f
+        //   run          : same, with B held (sprint — double tile rate)
+        //   circle       : B held, cycle RIGHT->DOWN->LEFT->UP every 32f
+        //                  (running in a loop: direction-change stress)
+        if (apConnFrame)
+        {
+            static int patMode = -1;
+            if (patMode < 0)
+            {
+                const char* pat = getenv("MELONDS_AP_PATTERN");
+                patMode = (!pat) ? 0 : (!strcmp(pat, "run")) ? 1
+                        : (!strcmp(pat, "circle")) ? 2
+                        : (!strcmp(pat, "waggle")) ? 3 : 0;
+            }
+            u32 cf = apFrame - apConnFrame;
+            u32 winLo = (apMode == 0) ? 300u : 1700u;
+            u32 winHi = (apMode == 0) ? 1500u : 2900u;
+
+            if (cf >= winLo && cf < winHi)
+            {
+                if (patMode == 3)
+                {
+                    // waggle: sprint direction-flips every 8f (240f), then a
+                    // sustained sprint (180f, direction alternates per cycle),
+                    // then a full stop (90f); repeat.  Host on the L/R axis,
+                    // join on U/D.
+                    u32 pc = (cf - winLo) % 510;
+                    int bitA = (apMode == 0) ? 5 : 6;   // LEFT / UP
+                    int bitB = (apMode == 0) ? 4 : 7;   // RIGHT / DOWN
+                    if (pc < 240)
+                    {
+                        press |= (1 << 1);
+                        press |= (1 << (((pc / 8) & 1) ? bitA : bitB));
+                    }
+                    else if (pc < 420)
+                    {
+                        press |= (1 << 1);
+                        press |= (1 << ((((cf - winLo) / 510) & 1) ? bitB : bitA));
+                    }
+                    // else: stopped
+                }
+                else if (patMode == 2)
+                {
+                    static const int circleBit[4] = { 4, 7, 5, 6 };  // R,D,L,U
+                    press |= (1 << 1);                               // B: run
+                    press |= (1 << circleBit[(cf / 32) & 3]);
+                }
+                else
+                {
+                    if (patMode == 1)
+                        press |= (1 << 1);                           // B: run
+                    if (apMode == 0)
+                        press |= (1 << (((cf / 90) & 1) ? 5 : 4));   // RIGHT/LEFT
+                    else
+                        press |= (1 << (((cf / 90) & 1) ? 7 : 6));   // UP/DOWN
+                }
+            }
+        }
+
+        // GAME-HANG PC SAMPLER: if the game's own frame counter stops
+        // advancing while connected, the ARM9 is wedged (emulator still
+        // fine).  Sample R15/R14 for 32 frames and dump — the exact hang
+        // site, resolvable against the linker map.
+        {
+            static u32 lastFC = 0, lastChangeAt = 0, dumped = 0;
+            u32 fcNow = apRd32(nds, pOwExp + 0x0C);
+            if (fcNow != lastFC) { lastFC = fcNow; lastChangeAt = apFrame; }
+            else if (apConnFrame && apFrame - lastChangeAt > 180 && dumped < 64)
+            {
+                char hn[64];
+                snprintf(hn, sizeof(hn), "melonds_hangpc_%s.txt", (apMode==0)?"host":"join");
+                FILE* hf = fopen(hn, "a");
+                if (hf)
+                {
+                    fprintf(hf, "f=%u FCstuck=%u R15=%08X R14=%08X R13=%08X R12=%08X CPSR=%08X IE=%08X IF=%08X IME=%u\n",
+                        apFrame, fcNow,
+                        nds->ARM9.R[15], nds->ARM9.R[14], nds->ARM9.R[13], nds->ARM9.R[12],
+                        nds->ARM9.CPSR, nds->IE[0], nds->IF[0], (unsigned)nds->IME[0]);
+                    fclose(hf);
+                    dumped++;
+                }
+            }
+        }
+
+        if (!apCsv)
+        {
+            char name[64];
+            snprintf(name, sizeof(name), "melonds_ap_%s.csv", (apMode == 0) ? "host" : "join");
+            apCsv = fopen(name, "w");
+            if (apCsv) fprintf(apCsv, "frame,wmState,peerMask,ownX,ownZ,ownFC,i0X,i0Z,i0FC,i1X,i1Z,i1FC,epoch,bumps,rew,recOw,recBlk,recParty,recPkt,lastSrcType,ovf,gaps,subf,rxqd,pexp,pcontig,bcnCalls,bcnApplies,bcnSeq,txF,rxF\n");
+        }
+        if (apCsv && pOwExp && pOwImp)
+        {
+            fprintf(apCsv, "%u,%u,%u,%d,%d,%u,%d,%d,%u,%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n",
+                apFrame, wmState, peerMask,
+                apRd16s(nds, pOwExp+4), apRd16s(nds, pOwExp+6), apRd32(nds, pOwExp+0x0C),
+                apRd16s(nds, pOwImp+4), apRd16s(nds, pOwImp+6), apRd32(nds, pOwImp+0x0C),
+                apRd16s(nds, pOwImp+48+4), apRd16s(nds, pOwImp+48+6), apRd32(nds, pOwImp+48+0x0C),
+                apRd8(nds, pDiag+8), apRd8(nds, pDiag+40), apRd32(nds, pDiag+28),
+                apRd8(nds, pDiag+36), apRd8(nds, pDiag+37), apRd8(nds, pDiag+38), apRd8(nds, pDiag+39),
+                apRd8(nds, pDiag+41), apRd8(nds, pDiag+11), apRd8(nds, pDiag+42), apRd8(nds, pDiag+43), apRd8(nds, pDiag+44), (apRd32(nds, pDiag+32)>>16)&0xFFFF, apRd32(nds, pDiag+32)&0xFFFF, apRd8(nds, pDiag+45), apRd8(nds, pDiag+46), apRd8(nds, pDiag+47), apRd32(nds, pDiag+12), apRd32(nds, pDiag+16));
+            if ((apFrame & 255) == 0) fflush(apCsv);
+        }
+    }
+
+    return mask & ~press;
+}
+
+}
+// ---------------------------------------------------------------------------
+
+namespace melonDS {
+extern volatile unsigned int g_wifiCrumb;
+extern volatile unsigned int g_wifiCrumbSeq;
+extern volatile unsigned int g_asyncSpin;
+}
+
+// Freeze watchdog: a detached thread (survives an emu-thread hang) that
+// records the last wifi breadcrumb whenever the emu thread stops making
+// progress.  Enabled by MELONDS_AP (autopilot) so normal runs pay nothing.
+static void MpWatchdogStart(const char* role)
+{
+    std::string r = role;
+    std::thread([r]() {
+        std::string name = "melonds_watchdog_" + r + ".txt";
+        unsigned int lastLoop = 0;
+        int stuckMs = 0;
+        for (;;)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            unsigned int loop = g_apLoopSeq;
+            if (loop == lastLoop)
+            {
+                // emu loop has not advanced a frame: RunFrame is wedged.
+                stuckMs += 200;
+                if (stuckMs == 1000 || stuckMs == 4000 || stuckMs == 12000)
+                {
+                    FILE* f = fopen(name.c_str(), "a");
+                    if (f) {
+                        // wifiSeq advancing while loop is stuck => spinning
+                        // inside a wifi loop; asyncSpin identifies phase-14
+                        fprintf(f, "STUCK %dms loop=%u wifiCrumb=%u wifiSeq=%u asyncSpin=%u\n",
+                            stuckMs, loop, melonDS::g_wifiCrumb,
+                            melonDS::g_wifiCrumbSeq, melonDS::g_asyncSpin);
+                        fclose(f);
+                    }
+                }
+            }
+            else { stuckMs = 0; lastLoop = loop; }
+        }
+    }).detach();
+}
+
 void EmuThread::run()
 {
+    {
+        const char* ap = getenv("MELONDS_AP");
+        if (ap) MpWatchdogStart(ap);
+    }
     Config::Table& globalCfg = emuInstance->getGlobalConfig();
     u32 mainScreenPos[3];
 
@@ -252,7 +526,7 @@ void EmuThread::run()
             }
 
             // process input and hotkeys
-            emuInstance->nds->SetKeyMask(emuInstance->inputMask);
+            emuInstance->nds->SetKeyMask(apApply(emuInstance->nds, emuInstance->inputMask));
 
             if (emuInstance->isTouching)
                 emuInstance->nds->TouchScreen(emuInstance->touchX, emuInstance->touchY);

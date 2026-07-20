@@ -135,6 +135,11 @@ private:
     ENetPeer* LastHostPeer;
     std::queue<ENetPacket*> RXQueue;
 
+    // async wireless mode: MP frames (CMD/reply/ack) get their own queue so
+    // the misc-frame lookup cannot destroy queued late MP frames.
+    std::queue<ENetPacket*> RXQueueMP;
+    void ProcessLANAsync(int type);
+
     u32 FrameCount;
 
     void ProcessDiscovery();

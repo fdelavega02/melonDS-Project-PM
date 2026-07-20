@@ -38,6 +38,8 @@
 #include <QPainter>
 #include <QKeyEvent>
 #include <QMimeData>
+#include <QTimer>
+#include <QSharedMemory>
 #include <QVector>
 #include <QCommandLineParser>
 #include <QDesktopServices>
@@ -657,7 +659,39 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
         // if the window was closed in fullscreen do not restore this
         setWindowState(windowState() & ~Qt::WindowFullScreen);
     }
+
     show();
+
+    // Multi-instance: separate PROCESSES each think they are instance 0
+    // (melonDS instance ids are per-process), so both restore the same
+    // saved geometry and stack exactly on top of each other.  Detect a
+    // second process via a cross-process marker (or the harness env) and
+    // offset it to the RIGHT, post-show (pre-show moves get overridden).
+    {
+        int slot = 0;
+        const char* ap = getenv("MELONDS_AP");
+        if (ap && !strcmp(ap, "join"))
+        {
+            slot = 1;
+        }
+        else if (!ap)
+        {
+            static QSharedMemory* firstWinClaim = nullptr;
+            if (!firstWinClaim)
+            {
+                firstWinClaim = new QSharedMemory("melonDS-first-window-claim");
+                if (!firstWinClaim->create(1))
+                    slot = 1;   // another process already owns the spot
+            }
+        }
+        if (slot > 0)
+        {
+            QTimer::singleShot(400, this, [this, slot]() {
+                int step = frameGeometry().width() + 8;
+                move(x() + step * slot, y());
+            });
+        }
+    }
 
     panel = nullptr;
     createScreenPanel();
@@ -1961,6 +1995,7 @@ void MainWindow::onMPSettingsFinished(int res)
     emuInstance->mpAudioMode = globalCfg.GetInt("MP.AudioMode");
     emuInstance->updateAudioMuteByWindowFocus();
     MPInterface::Get().SetRecvTimeout(globalCfg.GetInt("MP.RecvTimeout"));
+    MPInterface::Get().SetAsyncMode(globalCfg.GetBool("MP.AsyncMode"));
 
     emuThread->emuUnpause();
 }

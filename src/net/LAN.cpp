@@ -384,6 +384,12 @@ void LAN::EndSession()
         RXQueue.pop();
         enet_packet_destroy(packet);
     }
+    while (!RXQueueMP.empty())
+    {
+        ENetPacket* packet = RXQueueMP.front();
+        RXQueueMP.pop();
+        enet_packet_destroy(packet);
+    }
 
     for (int i = 0; i < 16; i++)
     {
@@ -795,9 +801,91 @@ void LAN::ProcessEvent(ENetEvent& event)
 // 0 = per-frame processing of events and eventual misc. frame
 // 1 = checking if a misc. frame has arrived
 // 2 = waiting for a MP frame
+// Async variant: misc (type 0) and MP (CMD/reply/ack) frames live in
+// separate queues so neither lookup can destroy the other's traffic, and
+// no receive path ever blocks.  Stock behavior below is untouched.
+void LAN::ProcessLANAsync(int type)
+{
+    if (!Host) return;
+
+    u32 now = (u32)Platform::GetMSCount();
+
+    while (!RXQueue.empty())
+    {
+        MPPacketHeader* h = (MPPacketHeader*)&RXQueue.front()->data[0];
+        if ((h->Magic > now) || (h->Magic < (now - 16)))
+        {
+            enet_packet_destroy(RXQueue.front());
+            RXQueue.pop();
+        }
+        else break;
+    }
+    while (!RXQueueMP.empty())
+    {
+        MPPacketHeader* h = (MPPacketHeader*)&RXQueueMP.front()->data[0];
+        if ((h->Magic > now) || (h->Magic < (now - 500)))
+        {
+            enet_packet_destroy(RXQueueMP.front());
+            RXQueueMP.pop();
+        }
+        else break;
+    }
+
+    if (type == 1 && !RXQueue.empty()) return;
+    if (type == 2 && !RXQueueMP.empty()) return;
+
+    ENetEvent event;
+    while (enet_host_service(Host, &event, 0) > 0)
+    {
+        if (event.type == ENET_EVENT_TYPE_RECEIVE && event.channelID == Chan_MP)
+        {
+            MPPacketHeader* header = (MPPacketHeader*)&event.packet->data[0];
+
+            bool good = true;
+            if (event.packet->dataLength < sizeof(MPPacketHeader))
+                good = false;
+            else if (header->Magic != 0x4946494E)
+                good = false;
+            else if (header->SenderID == MyPlayer.ID)
+                good = false;
+
+            if (!good)
+            {
+                enet_packet_destroy(event.packet);
+            }
+            else
+            {
+                header->Magic = (u32)Platform::GetMSCount();
+                event.packet->userData = event.peer;
+
+                if (header->Type == 0)
+                {
+                    RXQueue.push(event.packet);
+                    if (type == 1) return;
+                }
+                else
+                {
+                    RXQueueMP.push(event.packet);
+                    if (type == 2) return;
+                }
+            }
+        }
+        else
+        {
+            ProcessEvent(event);
+        }
+    }
+}
+
 void LAN::ProcessLAN(int type)
 {
     if (!Host) return;
+
+    if (AsyncMode)
+    {
+        ProcessLANAsync(type);
+        return;
+    }
 
     u32 time_last = (u32)Platform::GetMSCount();
 
@@ -972,10 +1060,12 @@ int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
     if (!Host) return 0;
 
     ProcessLAN(block ? 2 : 1);
-    if (RXQueue.empty()) return 0;
 
-    ENetPacket* enetpacket = RXQueue.front();
-    RXQueue.pop();
+    std::queue<ENetPacket*>& queue = (AsyncMode && block) ? RXQueueMP : RXQueue;
+    if (queue.empty()) return 0;
+
+    ENetPacket* enetpacket = queue.front();
+    queue.pop();
     MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
 
     u32 len = header->Length;
@@ -1047,23 +1137,33 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
     if ((myinstmask & ConnectedBitmask) == ConnectedBitmask)
         return 0;
 
+    std::queue<ENetPacket*>& queue = AsyncMode ? RXQueueMP : RXQueue;
+
+    extern volatile unsigned int g_wifiCrumb;
+    extern volatile unsigned int g_wifiCrumbSeq;
+    unsigned int gatherIter = 0;
+
     for (;;)
     {
+        g_wifiCrumb = 1600 + (gatherIter & 0xFF);
+        g_wifiCrumbSeq++;
+        gatherIter++;
+
         ProcessLAN(2);
-        if (RXQueue.empty())
+        if (queue.empty())
         {
             // no more replies available
             return ret;
         }
 
-        ENetPacket* enetpacket = RXQueue.front();
-        RXQueue.pop();
+        ENetPacket* enetpacket = queue.front();
+        queue.pop();
         MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
         bool good = true;
         if ((header->Type & 0xFFFF) != 2)
             good = false;
-        else if (header->Timestamp < (timestamp - 32))
-            good = false;
+        else if (!AsyncMode && header->Timestamp < (timestamp - 32))
+            good = false;   // async: late replies are still delivered
 
         if (good)
         {
@@ -1073,14 +1173,24 @@ u16 LAN::RecvReplies(int inst, u8* packets, u64 timestamp, u16 aidmask)
                 if (len > 1024) len = 1024;
 
                 u32 aid = header->Type >> 16;
+
+
                 memcpy(&packets[(aid-1)*1024], &enetpacket->data[sizeof(MPPacketHeader)], len);
 
                 ret |= (1<<aid);
             }
 
             myinstmask |= (1<<header->SenderID);
-            if (((myinstmask & ConnectedBitmask) == ConnectedBitmask) ||
-                ((ret & aidmask) == aidmask))
+
+            // async mode: do NOT return on the first reply.  Replies are a
+            // FIFO queue and latest-state-wins, so returning early handed
+            // the host the OLDEST queued reply while fresher ones piled up
+            // behind it — the host's view of a child lagged and updated at
+            // only ~5/s.  Keep draining (the memcpy above overwrites, so we
+            // retain the NEWEST) until the queue is empty.
+            if (!AsyncMode &&
+                (((myinstmask & ConnectedBitmask) == ConnectedBitmask) ||
+                 ((ret & aidmask) == aidmask)))
             {
                 // all the clients have sent their reply
                 enet_packet_destroy(enetpacket);
