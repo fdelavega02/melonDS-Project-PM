@@ -999,15 +999,26 @@ void BridgePump(melonDS::NDS* nds)
 
             gBr.roleSeenAt[r] = gBr.frame;
 
+            // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
+            // import block / party buffer only accepts the CHOSEN pair
+            // partner's data (ROM publishes intent at OW export +0x18;
+            // 0 = unpaired keeps first-come behaviour).  Without this every
+            // peer's bundle overwrote the legacy block and battle/trade/give
+            // requests "broadcast" to every player.  Per-role arrays always
+            // update.
             if (tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
-                memcpy(apPtr(nds, gBr.importBlk), rx + 4, sz);
+                melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
+                if (pairRole == 0 || r == (int)pairRole)
+                    memcpy(apPtr(nds, gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(nds, gBr.blkN + (r-1)*sz), rx + 4, sz);
                 memcpy(apPtr(nds, gBr.owImp + (r-1)*48), rx + 4 + sz, 48);
             }
             else if (tag == 2 && sz == gBr.partySize)
             {
-                memcpy(apPtr(nds, gBr.partyImp), rx + 4, sz);
+                melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
+                if (pairRole == 0 || r == (int)pairRole)
+                    memcpy(apPtr(nds, gBr.partyImp), rx + 4, sz);
                 if (gBr.partyN) memcpy(apPtr(nds, gBr.partyN + (r-1)*sz), rx + 4, sz);
             }
             else if (tag == 3 && sz == gBr.pktSize)
