@@ -1037,6 +1037,8 @@ void BridgePump(melonDS::NDS* nds)
             if (tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
                 melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
+                rx[4 + 0x12] = (melonDS::u8)r;   // stamp playerRole (old-hub duty;
+                                                 // MpPartnerIsLead dead without it)
                 if (pairRole == 0 || r == (int)pairRole)
                     memcpy(apPtr(nds, gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(nds, gBr.blkN + (r-1)*sz), rx + 4, sz);
