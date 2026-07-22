@@ -939,22 +939,26 @@ void BridgePump(melonDS::NDS* nds)
     apWr8(nds, gBr.ctl + 6, ++gBr.beat);   // fork heartbeat
 
     u8 wanted = apRd8(nds, gBr.ctl + 4);
-    if (!wanted || gBr.blkSize == 0 || gBr.blkSize > 512
-        || gBr.partySize == 0 || gBr.partySize > 2048
-        || gBr.pktSize == 0 || gBr.pktSize > 2048)
+    bool inGame = (wanted && gBr.blkSize != 0 && gBr.blkSize <= 512
+        && gBr.partySize != 0 && gBr.partySize <= 2048
+        && gBr.pktSize != 0 && gBr.pktSize <= 2048);
+
+    // NO early-return when !inGame: the old return left inbound frames
+    // QUEUED in the peer rx vectors (1MB cap -> DropPeer after ~80s of
+    // pre-activation idling) and never applied the peer's one-shot
+    // on-change party send if they activated before us.  Drain + apply
+    // ALWAYS (the mailboxes are inert BSS until the ROM activates); only
+    // the outbound bundles and the status/peerMask writes gate on inGame.
+    if (!inGame)
     {
         apWr8(nds, gBr.ctl + 7, 0);
         apWr8(nds, gBr.ctl + 9, 0);
-        for (int i = 0; i < 5; i++) gBr.roleSeenAt[i] = 0;
-        gBr.lastParty.clear();
-        gBr.lastPkt.clear();
-        return;
     }
 
     int myRole = mpnet::gNet.myRole();
     apWr8(nds, gBr.ctl + 8, (u8)myRole);
 
-    if (mpnet::gNet.anyUp())
+    if (inGame && mpnet::gNet.anyUp())
     {
         u8 buf[2100];
 
@@ -1010,6 +1014,17 @@ void BridgePump(melonDS::NDS* nds)
                 for (int pj = 0; pj < 3; pj++)
                     if (pj != pi) mpnet::gNet.enqueue(pj, rx, n);
 
+            {
+                // Peer NEWLY game-active (activated Wireless Play or
+                // reconnected): resend on-change channels — anything sent
+                // before this moment predated their readiness.
+                bool wasFresh = gBr.roleSeenAt[r] != 0 && gBr.frame - gBr.roleSeenAt[r] <= 180;
+                if (!wasFresh)
+                {
+                    gBr.lastParty.clear();
+                    gBr.lastPkt.clear();
+                }
+            }
             gBr.roleSeenAt[r] = gBr.frame;
 
             // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
@@ -1100,7 +1115,10 @@ void BridgePump(melonDS::NDS* nds)
         }
     }
 
-    // status + peer mask (freshness: a bundle from that role within ~3 s)
+    // status + peer mask (freshness: a bundle from that role within ~3 s).
+    // Only while OUR session is active — pre-activation the ROM must keep
+    // seeing "searching", and the !inGame branch above wrote 0s already.
+    if (inGame)
     {
         u8 mask = gBr.FreshPeerMask(myRole);
         apWr8(nds, gBr.ctl + 9, mask);
