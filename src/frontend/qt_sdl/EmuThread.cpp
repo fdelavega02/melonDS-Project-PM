@@ -640,6 +640,9 @@ struct Net
     Peer peers[3];                      // host: 3 client slots (slot i = role 2+i)
                                         // join: peers[0] = host link
     bool connecting = false;
+    bool freshPeer = false;     // link just came up: pump resends on-change
+                                // channels (party/pkt) — a peer connecting
+                                // after our first send never got our party
     melonDS::u32 retryAt = 0;
     int assignedRole = 0;               // join: role handed out by the host
 
@@ -729,7 +732,7 @@ struct Net
                 SOCKET s = accept(listener, NULL, NULL);
                 if (s == INVALID_SOCKET) break;
                 setNonBlock(s);
-                peers[i].s = s; peers[i].up = true;
+                peers[i].s = s; peers[i].up = true; freshPeer = true;
                 melonDS::u8 ctl[4] = { 2, 0, 0xFF, (melonDS::u8)(2 + i) };
                 peers[i].tx.insert(peers[i].tx.end(), ctl, ctl + 4);
                 printf("[BR] peer accepted -> role %d\n", 2 + i);
@@ -744,7 +747,7 @@ struct Net
                 FD_SET(h.s, &wr); FD_SET(h.s, &ex);
                 timeval tv = {0,0};
                 int r = select(0, NULL, &wr, &ex, &tv);
-                if (r > 0 && FD_ISSET(h.s, &wr)) { h.up = true; connecting = false; printf("[BR] connected to %s\n", joinIP); }
+                if (r > 0 && FD_ISSET(h.s, &wr)) { h.up = true; connecting = false; freshPeer = true; printf("[BR] connected to %s\n", joinIP); }
                 else if (r > 0 && FD_ISSET(h.s, &ex)) { dropPeer(0); retryAt = frame + 120; }
             }
             else if (frame >= retryAt)
@@ -756,7 +759,7 @@ struct Net
                 a.sin_family = AF_INET; a.sin_port = htons(PORT);
                 inet_pton(AF_INET, joinIP, &a.sin_addr);
                 int r = ::connect(h.s, (sockaddr*)&a, sizeof(a));
-                if (r == 0) { h.up = true; printf("[BR] connected to %s\n", joinIP); }
+                if (r == 0) { h.up = true; freshPeer = true; printf("[BR] connected to %s\n", joinIP); }
                 else if (WSAGetLastError() == WSAEWOULDBLOCK) connecting = true;
                 else { dropPeer(0); retryAt = frame + 120; }
             }
@@ -890,6 +893,16 @@ void BridgePump(melonDS::NDS* nds)
         if (mpnet::gNet.mode == 0) return;
     }
     mpnet::gNet.tick(gBr.frame);
+
+    // A peer link just came up: drop the on-change send caches so the next
+    // pump resends party/pkt — a peer connecting AFTER our first send never
+    // received our party (battle/trade launch waits on it forever).
+    if (mpnet::gNet.freshPeer)
+    {
+        mpnet::gNet.freshPeer = false;
+        gBr.lastParty.clear();
+        gBr.lastPkt.clear();
+    }
 
     if (!gBr.disc)
     {
