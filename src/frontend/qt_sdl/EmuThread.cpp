@@ -16,6 +16,12 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
+#ifdef _WIN32
+    // must precede any windows.h (pulled in by SDL) to get winsock2, not winsock1
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+#endif
+
 #include <stdlib.h>
 #include <time.h>
 #include <stdio.h>
@@ -141,8 +147,27 @@ melonDS::u8 apRd8(melonDS::NDS* nds, melonDS::u32 addr)
 {
     return nds->MainRAM[addr & nds->MainRAMMask];
 }
+void apWr32(melonDS::NDS* nds, melonDS::u32 addr, melonDS::u32 v)
+{
+    *(melonDS::u32*)&nds->MainRAM[addr & nds->MainRAMMask] = v;
+}
+
+// Activate/stop the wireless session via the ROM's debug inbox (sDiscovery[17],
+// cmd 19) — in-game activation moved from the SELECT shortcut to the
+// "Wireless Play" bag item, which an autopilot can't navigate to reliably.
+void apWirelessCtl(melonDS::NDS* nds, melonDS::u32 discBase, int on)
+{
+    if (!discBase) return;
+    melonDS::u32 inbox = apRd32(nds, discBase + 17*4);
+    if (!inbox) return;
+    apWr32(nds, inbox + 12, 19);            // cmd
+    apWr32(nds, inbox + 16, on ? 1 : 0);    // arg[0]
+    apWr32(nds, inbox + 4, apRd32(nds, inbox + 8) + 1);   // seq = ackSeq+1
+}
 
 static volatile unsigned int g_apLoopSeq = 0;   // emu-loop heartbeat
+static int apInField = 0;        // latched once the overworld is running
+static melonDS::u32 apFieldFC = 0;
 
 melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
 {
@@ -162,31 +187,49 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
 
     apFrame++;
 
-    // ---- LAN bring-up ----
-    if (apFrame == ((apMode == 0) ? 240u : 480u))
-    {
-        MPInterface::Set(MPInterface_LAN);
-        MPInterface::Get().SetRecvTimeout(300);
-        MPInterface::Get().SetAsyncMode(true);
-        LAN& lan = (LAN&)MPInterface::Get();
-        bool ok = (apMode == 0) ? lan.StartHost("AP0", 2)
-                                : lan.StartClient("AP1", apJoinIP);
-        printf("[AP] LAN %s -> %d\n", (apMode == 0) ? "host" : "join", ok ? 1 : 0);
-    }
+    // ---- transport bring-up ----
+    // The mailbox bridge now rides a direct TCP MpNet (the SAME wire protocol
+    // as the DeSmuME and BizHawk forks), NOT melonDS's ENet LAN — so all three
+    // emulators interoperate in one session.  The TCP transport self-starts
+    // inside BridgePump from the MELONDS_AP env; nothing to do here.
 
     // ---- input script ----
+    // MELONDS_AP_HOLD: boot to the overworld and start the LAN side, but
+    // do NOT activate in-game multiplayer and run no movement patterns.
+    // Activation fires when a file named "melonds_go.txt" appears in the
+    // working directory (SELECT, then A on "Activate Multiplayer").
+    static int apHold = -1;
+    static melonDS::u32 apGoFrame = 0;
+    if (apHold < 0) apHold = getenv("MELONDS_AP_HOLD") ? 1 : 0;
+
     u32 press = 0;
-    if (apFrame >= 700 && apFrame < 2000)
+    if (apFrame >= 700 && apFrame < 2000 && !apInField)
     {
         if ((apFrame % 40) < 8) press |= (1 << 0);            // tap A (title/file select)
     }
-    else if (apFrame >= 2060 && apFrame < 2072)
+    else if (!apHold && apFrame == 2120)
     {
-        press |= (1 << 2);                                     // SELECT: wireless menu
+        apWirelessCtl(nds, apDiscBase, 1);   // debug-inbox activation (cmd 19)
     }
-    else if (apFrame >= 2120 && apFrame < 2128)
+    else if (apHold && apFrame > 2100)
     {
-        press |= (1 << 0);                                     // A: Activate Multiplayer
+        if (!apGoFrame && (apFrame % 30) == 0)
+        {
+            char gn[64]; snprintf(gn, sizeof(gn), "melonds_go_%s.txt", (apMode==0)?"host":"join");
+            FILE* gf = fopen(gn, "r");
+            if (gf)
+            {
+                fclose(gf);
+                remove(gn);   // consume: re-armed for next touch
+                apGoFrame = apFrame;
+            }
+        }
+        if (apGoFrame)
+        {
+            u32 gf = apFrame - apGoFrame;
+            if (gf == 10)        apWirelessCtl(nds, apDiscBase, 1);  // inbox activation
+            else if (gf >= 300)  apGoFrame = 0;                      // re-arm
+        }
     }
 
     // ---- discovery scan + telemetry ----
@@ -212,10 +255,155 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
         u8 wmState = pDiag ? apRd8(nds, pDiag + 4) : 0xFF;
         u8 peerMask = pDiag ? apRd8(nds, pDiag + 7) : 0;
 
+        // field detection: overworld frameCounter advancing == in-field.
+        // Latches the boot A-mash OFF so it cannot leak into a counter menu.
+        if (!apInField)
+        {
+            u32 fc = apRd32(nds, pOwExp + 0x0C);
+            if (fc != 0 && apFieldFC != 0 && fc != apFieldFC) apInField = 1;
+            apFieldFC = fc;
+        }
+
         if (!apConnFrame && peerMask) 
         {
             apConnFrame = apFrame;
             printf("[AP] connected at frame %u\n", apFrame);
+        }
+
+        // Remote movement commands (hold mode): a file "melonds_move.txt"
+        // containing tokens like "L1 U20 R3 D2" walks the player tile-
+        // exactly: each token holds its direction until the live grid
+        // coordinate (read from the export block) reaches the target, with
+        // a timeout guard for walls.  File is consumed on pickup.
+        {
+            static char mvSeq[256];
+            static int mvLen = 0, mvPos = 0, mvActive = 0, mvBit = 0;
+            static int mvTX = 0, mvTZ = 0;
+            static int mvMode = 0;      // 0=walk 1=tap 2=wait
+            static int mvTimer = 0;
+            static int mvSprint = 0;
+            static melonDS::u32 mvDeadline = 0;
+
+            if (apFrame > 2100)
+            {
+                int curX = apRd16s(nds, pOwExp + 4);
+                int curZ = apRd16s(nds, pOwExp + 6);
+
+                if ((apFrame % 10) == 0 && (mvActive || mvPos < mvLen))
+                {
+                    // abort: a command file starting with '!' cancels everything
+                    char an[64]; snprintf(an, sizeof(an), "melonds_move_%s.txt", (apMode==0)?"host":"join");
+                    FILE* af = fopen(an, "r");
+                    if (af)
+                    {
+                        int c0 = fgetc(af);
+                        fclose(af);
+                        if (c0 == '!')
+                        {
+                            remove(an);
+                            mvActive = 0; mvLen = 0; mvPos = 0;
+                        }
+                    }
+                }
+                if (!mvActive && mvPos >= mvLen && (apFrame % 10) == 0)
+                {
+                    char mn[64]; snprintf(mn, sizeof(mn), "melonds_move_%s.txt", (apMode==0)?"host":"join");
+                    FILE* mf = fopen(mn, "r");
+                    if (mf)
+                    {
+                        mvLen = (int)fread(mvSeq, 1, 255, mf);
+                        if (mvLen < 0) mvLen = 0;
+                        mvSeq[mvLen] = 0;
+                        fclose(mf);
+                        remove(mn);
+                        mvPos = 0;
+                    }
+                }
+                if (!mvActive && mvPos < mvLen)
+                {
+                    while (mvPos < mvLen && (mvSeq[mvPos] == ' ' || mvSeq[mvPos] == 10 || mvSeq[mvPos] == 13 || mvSeq[mvPos] == 9)) mvPos++;
+                    if (mvPos < mvLen)
+                    {
+                        char d = mvSeq[mvPos++];
+                        int n = 0;
+                        while (mvPos < mvLen && mvSeq[mvPos] >= '0' && mvSeq[mvPos] <= '9') n = n * 10 + (mvSeq[mvPos++] - '0');
+                        char dl = (char)(d | 0x20);
+
+                        if (n == 0 && (dl=='l'||dl=='r'||dl=='u'||dl=='d'))
+                        {
+                            // bare direction = one TAP (face/menu navigation)
+                            switch (dl)
+                            {
+                            case 'l': mvBit = 5; break;
+                            case 'r': mvBit = 4; break;
+                            case 'u': mvBit = 6; break;
+                            default:  mvBit = 7; break;
+                            }
+                            mvMode = 1; mvTimer = 34;
+                            mvActive = 1;
+                        }
+                        else if (n > 0 && (dl=='l'||dl=='r'||dl=='u'||dl=='d'))
+                        {
+                            // movement: uppercase walks, lowercase sprints
+                            mvSprint = (d >= 'a');
+                            mvTX = curX; mvTZ = curZ;
+                            switch (dl)
+                            {
+                            case 'l': mvBit = 5; mvTX = curX - n; break;
+                            case 'r': mvBit = 4; mvTX = curX + n; break;
+                            case 'u': mvBit = 6; mvTZ = curZ - n; break;
+                            default:  mvBit = 7; mvTZ = curZ + n; break;
+                            }
+                            mvDeadline = apFrame + (melonDS::u32)n * 60 + 240;
+                            mvMode = 0;
+                            mvActive = 1;
+                        }
+                        else if (dl=='w' && n > 0)
+                        {
+                            mvMode = 2; mvTimer = n; mvActive = 1;
+                        }
+                        else if (dl=='a'||dl=='b'||dl=='x'||dl=='y'||dl=='s'||dl=='c')
+                        {
+                            // button tap: A B X Y S(tart) C(select)
+                            switch (dl)
+                            {
+                            case 'a': mvBit = 0; break;
+                            case 'b': mvBit = 1; break;
+                            case 'c': mvBit = 2; break;
+                            case 's': mvBit = 3; break;
+                            case 'x': mvBit = 10; break;
+                            default:  mvBit = 11; break;
+                            }
+                            mvMode = 1; mvTimer = 40;   // 12f press + gap
+                            mvActive = 1;
+                        }
+                    }
+                }
+                if (mvActive)
+                {
+                    if (mvMode == 0)
+                    {
+                        int done = (apFrame > mvDeadline)
+                            || (mvBit == 5 && curX <= mvTX) || (mvBit == 4 && curX >= mvTX)
+                            || (mvBit == 6 && curZ <= mvTZ) || (mvBit == 7 && curZ >= mvTZ);
+                        if (done) mvActive = 0;
+                        else
+                        {
+                            press |= (1u << mvBit);
+                            if (mvSprint) press |= (1u << 1);
+                        }
+                    }
+                    else if (mvMode == 1)
+                    {
+                        if (mvTimer > 28) press |= (1u << mvBit);   // first 12f pressed
+                        if (--mvTimer <= 0) mvActive = 0;
+                    }
+                    else
+                    {
+                        if (--mvTimer <= 0) mvActive = 0;
+                    }
+                }
+            }
         }
 
         // movement phases relative to connect.
@@ -224,7 +412,7 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
         //   run          : same, with B held (sprint — double tile rate)
         //   circle       : B held, cycle RIGHT->DOWN->LEFT->UP every 32f
         //                  (running in a loop: direction-change stress)
-        if (apConnFrame)
+        if (apConnFrame && !apHold)
         {
             static int patMode = -1;
             if (patMode < 0)
@@ -232,13 +420,51 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
                 const char* pat = getenv("MELONDS_AP_PATTERN");
                 patMode = (!pat) ? 0 : (!strcmp(pat, "run")) ? 1
                         : (!strcmp(pat, "circle")) ? 2
-                        : (!strcmp(pat, "waggle")) ? 3 : 0;
+                        : (!strcmp(pat, "waggle")) ? 3
+                        : (!strcmp(pat, "ugclient")) ? 4
+                        : (!strcmp(pat, "ughost")) ? 5 : 0;
             }
             u32 cf = apFrame - apConnFrame;
             u32 winLo = (apMode == 0) ? 300u : 1700u;
             u32 winHi = (apMode == 0) ? 1500u : 2900u;
 
-            if (cf >= winLo && cf < winHi)
+            if (patMode >= 4)
+            {
+                // Underground leave/re-enter repro (the user's manual recipe):
+                //   both: Y (registered Explorer Kit) then A every 1s x30 -> descend
+                //   leaver only: X menu, Down x5, A x4 (2s apart) -> "Go up"
+                //   wait ~15s, then Y + A every 1s x30 -> descend again
+                // ugclient: the JOIN instance leaves; ughost: the HOST leaves.
+                bool leaver = (patMode == 4) ? (apMode == 1) : (apMode == 0);
+                // 4-player runs: several instances share apMode=join, but only
+                // ONE should exercise the leave/re-enter arc.  Extra joiners
+                // set MELONDS_AP_NOLEAVE=1 and just descend + stand.
+                static int apNoLeave = -1;
+                if (apNoLeave < 0) apNoLeave = getenv("MELONDS_AP_NOLEAVE") ? 1 : 0;
+                if (apNoLeave) leaver = false;
+
+                if (cf >= 300 && cf < 308)
+                    press |= (1u << 11);                                   // Y: Explorer Kit
+                else if (cf >= 360 && cf < 360 + 30*60 && ((cf - 360) % 60) < 8)
+                    press |= (1u << 0);                                    // A x30 (1/s)
+
+                if (leaver)
+                {
+                    const u32 L = 2400;                                    // below by now
+                    const u32 R = L + 240 + 4*120 + 900;                   // after up + ~15s
+                    if (cf >= L && cf < L + 8)
+                        press |= (1u << 10);                               // X: menu
+                    else if (cf >= L + 60 && cf < L + 60 + 5*24 && ((cf - L - 60) % 24) < 8)
+                        press |= (1u << 7);                                // Down x5
+                    else if (cf >= L + 240 && cf < L + 240 + 4*120 && ((cf - L - 240) % 120) < 8)
+                        press |= (1u << 0);                                // A x4 (2s apart)
+                    else if (cf >= R && cf < R + 8)
+                        press |= (1u << 11);                               // Y again
+                    else if (cf >= R + 60 && cf < R + 60 + 30*60 && ((cf - R - 60) % 60) < 8)
+                        press |= (1u << 0);                                // A x30: re-descend
+                }
+            }
+            else if (cf >= winLo && cf < winHi)
             {
                 if (patMode == 3)
                 {
@@ -286,7 +512,7 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
         {
             static u32 lastFC = 0, lastChangeAt = 0, dumped = 0;
             u32 fcNow = apRd32(nds, pOwExp + 0x0C);
-            if (fcNow != lastFC) { lastFC = fcNow; lastChangeAt = apFrame; }
+            if (fcNow != lastFC) { lastFC = fcNow; lastChangeAt = apFrame; dumped = 0; }
             else if (apConnFrame && apFrame - lastChangeAt > 180 && dumped < 64)
             {
                 char hn[64];
@@ -372,6 +598,495 @@ static void MpWatchdogStart(const char* role)
         }
     }).detach();
 }
+
+
+// ---------------------------------------------------------------------------
+// Fork-embedded mailbox bridge.  When the loaded ROM publishes the bridge
+// control block (discovery slot 31) and the player has a LAN session, the
+// ROM's field menu can request a bridge session: this pump then syncs the
+// ROM's multiplayer mailboxes across the LAN link at frame rate (reliable
+// ENet channel, packet type 4).  The emulated radio is never touched, so
+// native wireless features keep full ownership of it.
+// ---------------------------------------------------------------------------
+namespace
+{
+
+// ---------------------------------------------------------------------------
+// Cross-emulator TCP transport.  Identical wire protocol to the DeSmuME and
+// BizHawk forks — [u16 len LE][tag u8][role u8][size u16 LE][payload], plus a
+// [len=2][0xFF][role] control frame the host sends to assign each joiner its
+// role — so a melonDS host/joiner interoperates with DeSmuME and BizHawk
+// instances in the same session.  Host listens :7820 and relays; joiners
+// connect.  Non-blocking; drained once per frame from BridgePump.
+// ---------------------------------------------------------------------------
+namespace mpnet
+{
+const int PORT = 7820;
+const melonDS::u32 MAXFRAME = 8192;
+
+struct Peer
+{
+    SOCKET s = INVALID_SOCKET;
+    bool up = false;
+    std::vector<melonDS::u8> rx, tx;
+};
+
+struct Net
+{
+    int mode = 0;                       // 0 off, 1 host, 2 join
+    char joinIP[64] = "127.0.0.1";
+    bool started = false;
+    SOCKET listener = INVALID_SOCKET;
+    Peer peers[3];                      // host: 3 client slots (slot i = role 2+i)
+                                        // join: peers[0] = host link
+    bool connecting = false;
+    melonDS::u32 retryAt = 0;
+    int assignedRole = 0;               // join: role handed out by the host
+
+    int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
+    bool anyUp() const { for (int i=0;i<3;i++) if (peers[i].up) return true; return false; }
+
+    static void setNonBlock(SOCKET s)
+    {
+        u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+        BOOL nd = TRUE; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
+    }
+
+    void startHost()
+    {
+        WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+        mode = 1; started = true;
+        listener = socket(AF_INET, SOCK_STREAM, 0);
+        if (listener == INVALID_SOCKET) { mode = 0; return; }
+        BOOL yes = TRUE;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+        sockaddr_in a; memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons(PORT);
+        if (bind(listener, (sockaddr*)&a, sizeof(a)) != 0 || listen(listener, 3) != 0)
+        {
+            closesocket(listener); listener = INVALID_SOCKET; mode = 0; return;
+        }
+        setNonBlock(listener);
+        printf("[BR] hosting on :%d\n", PORT);
+    }
+
+    void startJoin(const char* ip)
+    {
+        WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+        if (ip && ip[0]) { strncpy(joinIP, ip, sizeof(joinIP)-1); joinIP[sizeof(joinIP)-1] = 0; }
+        mode = 2; started = true;
+    }
+
+    // LAN discovery beacon (UDP :7821, shared cross-emulator format) so a
+    // melonDS host also shows up in DeSmuME / BizHawk auto-find lists.
+    SOCKET beaconTx = INVALID_SOCKET;
+    melonDS::u32 lastBeacon = 0;
+    void beaconTick(melonDS::u32 frame, melonDS::u8 players)
+    {
+        if (mode != 1) return;
+        if (beaconTx == INVALID_SOCKET)
+        {
+            beaconTx = socket(AF_INET, SOCK_DGRAM, 0);
+            if (beaconTx == INVALID_SOCKET) return;
+            BOOL b = TRUE; setsockopt(beaconTx, SOL_SOCKET, SO_BROADCAST, (const char*)&b, sizeof(b));
+        }
+        if (frame - lastBeacon < 60) return;
+        lastBeacon = frame;
+        melonDS::u8 buf[32]; memset(buf, 0, sizeof(buf));
+        memcpy(buf, "PLATMP", 6); buf[6] = 1; buf[7] = players;
+        char nm[24]; DWORD n = 24; if (!GetComputerNameA(nm, &n)) { strcpy(nm, "melonDS"); n = 7; }
+        memcpy(buf + 8, nm, (n < 24) ? n : 23);
+        sockaddr_in a; memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET; a.sin_port = htons(7821); a.sin_addr.s_addr = INADDR_BROADCAST;
+        sendto(beaconTx, (const char*)buf, 32, 0, (sockaddr*)&a, sizeof(a));
+    }
+
+    void startFromEnv()
+    {
+        started = true;
+        const char* e = getenv("MELONDS_AP");
+        if (e && !strcmp(e, "host")) startHost();
+        else if (e && !strcmp(e, "join")) startJoin(getenv("MELONDS_AP_IP"));
+        else mode = 0;
+    }
+
+    void dropPeer(int i)
+    {
+        Peer& p = peers[i];
+        if (p.s != INVALID_SOCKET) closesocket(p.s);
+        p.s = INVALID_SOCKET; p.up = false; p.rx.clear(); p.tx.clear();
+        if (mode == 2) connecting = false;
+    }
+
+    void tick(melonDS::u32 frame)
+    {
+        if (mode == 0) return;
+        if (mode == 1 && listener != INVALID_SOCKET)
+        {
+            for (int i = 0; i < 3; i++)
+            {
+                if (peers[i].up) continue;
+                SOCKET s = accept(listener, NULL, NULL);
+                if (s == INVALID_SOCKET) break;
+                setNonBlock(s);
+                peers[i].s = s; peers[i].up = true;
+                melonDS::u8 ctl[4] = { 2, 0, 0xFF, (melonDS::u8)(2 + i) };
+                peers[i].tx.insert(peers[i].tx.end(), ctl, ctl + 4);
+                printf("[BR] peer accepted -> role %d\n", 2 + i);
+            }
+        }
+        else if (mode == 2 && !peers[0].up)
+        {
+            Peer& h = peers[0];
+            if (connecting)
+            {
+                fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex);
+                FD_SET(h.s, &wr); FD_SET(h.s, &ex);
+                timeval tv = {0,0};
+                int r = select(0, NULL, &wr, &ex, &tv);
+                if (r > 0 && FD_ISSET(h.s, &wr)) { h.up = true; connecting = false; printf("[BR] connected to %s\n", joinIP); }
+                else if (r > 0 && FD_ISSET(h.s, &ex)) { dropPeer(0); retryAt = frame + 120; }
+            }
+            else if (frame >= retryAt)
+            {
+                h.s = socket(AF_INET, SOCK_STREAM, 0);
+                if (h.s == INVALID_SOCKET) { retryAt = frame + 120; return; }
+                setNonBlock(h.s);
+                sockaddr_in a; memset(&a, 0, sizeof(a));
+                a.sin_family = AF_INET; a.sin_port = htons(PORT);
+                inet_pton(AF_INET, joinIP, &a.sin_addr);
+                int r = ::connect(h.s, (sockaddr*)&a, sizeof(a));
+                if (r == 0) { h.up = true; printf("[BR] connected to %s\n", joinIP); }
+                else if (WSAGetLastError() == WSAEWOULDBLOCK) connecting = true;
+                else { dropPeer(0); retryAt = frame + 120; }
+            }
+        }
+        for (int i = 0; i < 3; i++) { flush(i); pumpRecv(i); }
+    }
+
+    void enqueue(int i, const melonDS::u8* p, melonDS::u32 n)
+    {
+        Peer& pr = peers[i];
+        if (!pr.up || n == 0 || n > MAXFRAME) return;
+        if (pr.tx.size() > 512*1024) return;
+        melonDS::u8 hdr[2] = { (melonDS::u8)(n & 0xFF), (melonDS::u8)(n >> 8) };
+        pr.tx.insert(pr.tx.end(), hdr, hdr + 2);
+        pr.tx.insert(pr.tx.end(), p, p + n);
+        flush(i);
+    }
+    void sendAll(const melonDS::u8* p, melonDS::u32 n) { for (int i=0;i<3;i++) enqueue(i, p, n); }
+
+    void flush(int i)
+    {
+        Peer& p = peers[i];
+        if (!p.up || p.tx.empty()) return;
+        int r = ::send(p.s, (const char*)p.tx.data(), (int)p.tx.size(), 0);
+        if (r > 0) p.tx.erase(p.tx.begin(), p.tx.begin() + r);
+        else if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) dropPeer(i);
+    }
+
+    void pumpRecv(int i)
+    {
+        Peer& p = peers[i];
+        if (!p.up) return;
+        char tmp[16384];
+        for (;;)
+        {
+            int r = ::recv(p.s, tmp, sizeof(tmp), 0);
+            if (r > 0) { p.rx.insert(p.rx.end(), tmp, tmp + r); if (p.rx.size() > 1024*1024) { dropPeer(i); return; } }
+            else if (r == 0) { dropPeer(i); return; }
+            else { if (WSAGetLastError() != WSAEWOULDBLOCK) dropPeer(i); return; }
+        }
+    }
+
+    melonDS::u32 recvFrame(int i, melonDS::u8* out, melonDS::u32 outMax)
+    {
+        Peer& p = peers[i];
+        if (p.rx.size() < 2) return 0;
+        melonDS::u32 n = (melonDS::u32)p.rx[0] | ((melonDS::u32)p.rx[1] << 8);
+        if (n == 0 || n > MAXFRAME) { dropPeer(i); return 0; }
+        if (p.rx.size() < 2 + n) return 0;
+        melonDS::u32 c = (n <= outMax) ? n : outMax;
+        memcpy(out, p.rx.data() + 2, c);
+        p.rx.erase(p.rx.begin(), p.rx.begin() + 2 + n);
+        return c;
+    }
+
+    void shutdown()
+    {
+        for (int i=0;i<3;i++) dropPeer(i);
+        if (beaconTx != INVALID_SOCKET) { closesocket(beaconTx); beaconTx = INVALID_SOCKET; }
+        if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
+        mode = 0;
+    }
+};
+Net gNet;
+}
+
+struct BridgeSt
+{
+    melonDS::u32 frame = 0;
+    melonDS::u32 disc = 0, ctl = 0;
+    melonDS::u32 exportBlk = 0, importBlk = 0, partyExp = 0, partyImp = 0;
+    melonDS::u32 pktExp = 0, pktImp = 0, owExp = 0, owImp = 0;
+    melonDS::u32 blkN = 0, partyN = 0;
+    melonDS::u32 blkSize = 0, partySize = 0, pktSize = 0;
+    melonDS::u8 beat = 0;
+    std::vector<melonDS::u8> lastParty, lastPkt;
+    melonDS::u32 roleSeenAt[5] = {0,0,0,0,0};
+    melonDS::u32 dbgTx = 0, dbgRx = 0, dbgPktTx = 0, dbgPktRx = 0;
+
+    melonDS::u8 FreshPeerMask(int myRole) const
+    {
+        melonDS::u8 m = 0;
+        for (int r = 1; r <= 4; r++)
+            if (r != myRole && roleSeenAt[r] != 0 && frame - roleSeenAt[r] <= 180)
+                m |= (melonDS::u8)(1 << (r - 1));
+        return m;
+    }
+};
+BridgeSt gBr;
+
+void apWr8(melonDS::NDS* nds, melonDS::u32 addr, melonDS::u8 v)
+{
+    nds->MainRAM[addr & nds->MainRAMMask] = v;
+}
+melonDS::u8* apPtr(melonDS::NDS* nds, melonDS::u32 addr)
+{
+    return &nds->MainRAM[addr & nds->MainRAMMask];
+}
+
+void BridgePump(melonDS::NDS* nds)
+{
+    using namespace melonDS;
+    gBr.frame++;
+
+    if (!mpnet::gNet.started) mpnet::gNet.startFromEnv();
+    if (mpnet::gNet.mode == 0)
+    {
+        // No env config (a real player): follow the melonDS LAN lobby the
+        // player used.  Hosting a LAN game starts the TCP bridge host;
+        // joining one connects the bridge to the lobby host IP.  The ENet
+        // session is left alone; the bridge rides alongside on :7820.
+        if (MPInterface::GetType() == MPInterface_LAN)
+        {
+            LAN& lan = (LAN&)MPInterface::Get();
+            if (lan.GetIsHost())
+            {
+                mpnet::gNet.startHost();
+            }
+            else if (lan.GetMyPlayerID() > 0)
+            {
+                melonDS::u32 ha = lan.GetHostAddress();
+                if (ha)
+                {
+                    char ip[32];
+                    snprintf(ip, sizeof(ip), "%u.%u.%u.%u",
+                        ha & 0xFF, (ha >> 8) & 0xFF, (ha >> 16) & 0xFF, (ha >> 24) & 0xFF);
+                    mpnet::gNet.startJoin(ip);
+                }
+            }
+        }
+        if (mpnet::gNet.mode == 0) return;
+    }
+    mpnet::gNet.tick(gBr.frame);
+
+    if (!gBr.disc)
+    {
+        if ((gBr.frame % 60) != 0) return;
+        for (u32 off = 0; off < 0x400000 - 16; off += 4)
+        {
+            if (*(u32*)&nds->MainRAM[off] == 0xCAFE1234
+                && *(u32*)&nds->MainRAM[off+4] == 0x5678CAFE)
+            {
+                gBr.disc = 0x02000000 + off;
+                break;
+            }
+        }
+        if (!gBr.disc) return;
+
+        gBr.exportBlk = apRd32(nds, gBr.disc + 2*4);
+        gBr.importBlk = apRd32(nds, gBr.disc + 3*4);
+        gBr.partyExp  = apRd32(nds, gBr.disc + 4*4);
+        gBr.partyImp  = apRd32(nds, gBr.disc + 5*4);
+        gBr.pktExp    = apRd32(nds, gBr.disc + 12*4);
+        gBr.pktImp    = apRd32(nds, gBr.disc + 13*4);
+        gBr.owExp     = apRd32(nds, gBr.disc + 14*4);
+        gBr.owImp     = apRd32(nds, gBr.disc + 15*4);
+        gBr.blkSize   = apRd32(nds, gBr.disc + 20*4) & 0xFFFF;
+        gBr.blkN      = apRd32(nds, gBr.disc + 25*4);
+        gBr.partyN    = apRd32(nds, gBr.disc + 26*4);
+        gBr.ctl       = apRd32(nds, gBr.disc + 31*4);
+    }
+    if (!gBr.ctl || apRd32(nds, gBr.ctl) != 0x42524731) return;
+
+    gBr.partySize = apRd16s(nds, gBr.ctl + 10) & 0xFFFF;
+    gBr.pktSize   = apRd16s(nds, gBr.ctl + 12) & 0xFFFF;
+
+    apWr8(nds, gBr.ctl + 6, ++gBr.beat);   // fork heartbeat
+
+    u8 wanted = apRd8(nds, gBr.ctl + 4);
+    if (!wanted || gBr.blkSize == 0 || gBr.blkSize > 512
+        || gBr.partySize == 0 || gBr.partySize > 2048
+        || gBr.pktSize == 0 || gBr.pktSize > 2048)
+    {
+        apWr8(nds, gBr.ctl + 7, 0);
+        apWr8(nds, gBr.ctl + 9, 0);
+        for (int i = 0; i < 5; i++) gBr.roleSeenAt[i] = 0;
+        gBr.lastParty.clear();
+        gBr.lastPkt.clear();
+        return;
+    }
+
+    int myRole = mpnet::gNet.myRole();
+    apWr8(nds, gBr.ctl + 8, (u8)myRole);
+
+    if (mpnet::gNet.anyUp())
+    {
+        u8 buf[2100];
+
+        // bundle: [1][role][blkSize u16][block][ow 48] — every frame
+        buf[0] = 1; buf[1] = (u8)myRole;
+        buf[2] = (u8)(gBr.blkSize & 0xFF); buf[3] = (u8)(gBr.blkSize >> 8);
+        memcpy(buf + 4, apPtr(nds, gBr.exportBlk), gBr.blkSize);
+        memcpy(buf + 4 + gBr.blkSize, apPtr(nds, gBr.owExp), 48);
+        mpnet::gNet.sendAll(buf, 4 + gBr.blkSize + 48); gBr.dbgTx++;
+
+        // party: on content change
+        if (gBr.lastParty.size() != gBr.partySize
+            || memcmp(gBr.lastParty.data(), apPtr(nds, gBr.partyExp), gBr.partySize) != 0)
+        {
+            gBr.lastParty.assign(apPtr(nds, gBr.partyExp), apPtr(nds, gBr.partyExp) + gBr.partySize);
+            buf[0] = 2; buf[1] = (u8)myRole;
+            buf[2] = (u8)(gBr.partySize & 0xFF); buf[3] = (u8)(gBr.partySize >> 8);
+            memcpy(buf + 4, gBr.lastParty.data(), gBr.partySize);
+            mpnet::gNet.sendAll(buf, 4 + gBr.partySize);
+        }
+
+        // pkt channel: on content change
+        if (gBr.lastPkt.size() != gBr.pktSize
+            || memcmp(gBr.lastPkt.data(), apPtr(nds, gBr.pktExp), gBr.pktSize) != 0)
+        {
+            gBr.lastPkt.assign(apPtr(nds, gBr.pktExp), apPtr(nds, gBr.pktExp) + gBr.pktSize);
+            buf[0] = 3; buf[1] = (u8)myRole;
+            buf[2] = (u8)(gBr.pktSize & 0xFF); buf[3] = (u8)(gBr.pktSize >> 8);
+            memcpy(buf + 4, gBr.lastPkt.data(), gBr.pktSize);
+            mpnet::gNet.sendAll(buf, 4 + gBr.pktSize); gBr.dbgPktTx++;
+        }
+    }
+
+    // receive: apply peers' mailboxes (per peer link; host relays)
+    {
+        u8 rx[2100];
+        u32 n;
+        for (int pi = 0; pi < 3; pi++)
+        while ((n = mpnet::gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
+        {
+            gBr.dbgRx++;
+            if (n == 2 && rx[0] == 0xFF) { mpnet::gNet.assignedRole = rx[1]; continue; }  // host-assigned role
+            if (n < 4) continue;
+            int tag = rx[0], r = rx[1];
+            u32 sz = (u32)(rx[2] | (rx[3] << 8));
+            if (r < 1 || r > 4 || r == myRole) continue;
+            if (n < 4 + sz) continue;
+
+            // Host relay: a client bundle reaches only the host — forward it to
+            // the other clients so everyone sees everyone (origin drops its own
+            // echo via r == myRole).
+            if (myRole == 1)
+                for (int pj = 0; pj < 3; pj++)
+                    if (pj != pi) mpnet::gNet.enqueue(pj, rx, n);
+
+            gBr.roleSeenAt[r] = gBr.frame;
+
+            if (tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
+            {
+                memcpy(apPtr(nds, gBr.importBlk), rx + 4, sz);
+                if (gBr.blkN) memcpy(apPtr(nds, gBr.blkN + (r-1)*sz), rx + 4, sz);
+                memcpy(apPtr(nds, gBr.owImp + (r-1)*48), rx + 4 + sz, 48);
+            }
+            else if (tag == 2 && sz == gBr.partySize)
+            {
+                memcpy(apPtr(nds, gBr.partyImp), rx + 4, sz);
+                if (gBr.partyN) memcpy(apPtr(nds, gBr.partyN + (r-1)*sz), rx + 4, sz);
+            }
+            else if (tag == 3 && sz == gBr.pktSize)
+            {
+                memcpy(apPtr(nds, gBr.pktImp + (r-1)*sz), rx + 4, sz);
+                gBr.dbgPktRx++;
+            }
+        }
+    }
+
+    if ((gBr.frame % 120) == 0)
+    {
+        {
+            melonDS::u32 shim = apRd32(nds, gBr.disc + 16*4);
+            melonDS::u8 shimA = shim ? apRd8(nds, shim) : 0xFF;
+            melonDS::u32 commTask = shim ? apRd32(nds, shim + 12) : 0;
+            printf("[BR] f=%u role=%d wanted=%u tx=%u rx=%u pktTx=%u pktRx=%u shim=%u commTask=%08X%c",
+                gBr.frame, myRole, wanted, gBr.dbgTx, gBr.dbgRx,
+                gBr.dbgPktTx, gBr.dbgPktRx, shimA, commTask, 10);
+        }
+        fflush(stdout);
+    }
+
+    // ALWAYS-ON crash catcher: if the game's overworld frame counter stops
+    // while a bridge session is active, the ARM9 is wedged/crashed — record
+    // its registers so the faulting site can be mapped, regardless of how
+    // this instance was launched.
+    {
+        static melonDS::u32 ccLastFC = 0, ccChangedAt = 0;
+        static int ccDumped = 0;
+        melonDS::u32 fcNow = apRd32(nds, gBr.owExp + 0x0C);
+        if (fcNow != ccLastFC)
+        {
+            ccLastFC = fcNow;
+            ccChangedAt = gBr.frame;
+            ccDumped = 0;
+        }
+        else if (wanted && gBr.frame - ccChangedAt > 180 && ccDumped < 24)
+        {
+            FILE* cf = fopen("melonds_hangpc_auto.txt", "a");
+            if (cf)
+            {
+                fprintf(cf, "role=%d f=%u FCstuck=%u R15=%08X R14=%08X R13=%08X R12=%08X CPSR=%08X%c",
+                    myRole, gBr.frame, fcNow,
+                    nds->ARM9.R[15], nds->ARM9.R[14], nds->ARM9.R[13], nds->ARM9.R[12],
+                    nds->ARM9.CPSR, 10);
+                fprintf(cf, "  regs R0-11:");
+                for (int ri = 0; ri < 12; ri++) fprintf(cf, " %08X", nds->ARM9.R[ri]);
+                fprintf(cf, "%c  banked SVC=%08X,%08X ABT=%08X,%08X IRQ=%08X,%08X%c",
+                    10, nds->ARM9.R_SVC[0], nds->ARM9.R_SVC[1],
+                    nds->ARM9.R_ABT[0], nds->ARM9.R_ABT[1],
+                    nds->ARM9.R_IRQ[0], nds->ARM9.R_IRQ[1], 10);
+                // stack dump from the most plausible pre-crash SP
+                melonDS::u32 sp = nds->ARM9.R_ABT[0] ? nds->ARM9.R_ABT[0] : nds->ARM9.R_SVC[0];
+                if (!sp || (sp >> 24) != 0x02) sp = nds->ARM9.R_SVC[0];
+                if (sp && (sp >> 24) == 0x02)
+                {
+                    fprintf(cf, "  stack@%08X:", sp);
+                    for (int si = 0; si < 32; si++)
+                        fprintf(cf, " %08X", apRd32(nds, sp + si*4));
+                    fprintf(cf, "%c", 10);
+                }
+                fclose(cf);
+                ccDumped++;
+            }
+        }
+    }
+
+    // status + peer mask (freshness: a bundle from that role within ~3 s)
+    {
+        u8 mask = gBr.FreshPeerMask(myRole);
+        apWr8(nds, gBr.ctl + 9, mask);
+        apWr8(nds, gBr.ctl + 7, mask ? 2 : 1);
+        mpnet::gNet.beaconTick(gBr.frame, mask ? 2 : 1);
+    }
+}
+
+}
+// ---------------------------------------------------------------------------
 
 void EmuThread::run()
 {
@@ -526,6 +1241,7 @@ void EmuThread::run()
             }
 
             // process input and hotkeys
+            BridgePump(emuInstance->nds);
             emuInstance->nds->SetKeyMask(apApply(emuInstance->nds, emuInstance->inputMask));
 
             if (emuInstance->isTouching)

@@ -90,6 +90,7 @@ LAN::LAN() noexcept : Inited(false)
 
     memset(RemotePeers, 0, sizeof(RemotePeers));
     memset(Players, 0, sizeof(Players));
+    memset(ConnectingSince, 0, sizeof(ConnectingSince));
     NumPlayers = 0;
     MaxPlayers = 0;
 
@@ -295,7 +296,11 @@ bool LAN::StartClient(const char* playername, const char* host)
     ENetEvent event;
     int conn = 0;
     u32 starttick = (u32)Platform::GetMSCount();
-    const int conntimeout = 5000;
+    // 20 s (was 5 s): several emulators sharing one PC's CPU can starve a
+    // joiner's handshake past 5 s, and a timed-out join leaks a host slot.
+    // Generous here is harmless — a real unreachable host still fails via the
+    // ENet connect attempt, just later.
+    const int conntimeout = 20000;
     for (;;)
     {
         u32 curtick = (u32)Platform::GetMSCount();
@@ -388,6 +393,12 @@ void LAN::EndSession()
     {
         ENetPacket* packet = RXQueueMP.front();
         RXQueueMP.pop();
+        enet_packet_destroy(packet);
+    }
+    while (!RXQueueBridge.empty())
+    {
+        ENetPacket* packet = RXQueueBridge.front();
+        RXQueueBridge.pop();
         enet_packet_destroy(packet);
     }
 
@@ -559,6 +570,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
                 Players[id].Status = Player_Connecting;
                 Players[id].Address = event.peer->address.host;
                 event.peer->data = &Players[id];
+                ConnectingSince[id] = (u32)Platform::GetMSCount();
                 NumPlayers++;
 
                 Platform::Mutex_Unlock(PlayersMutex);
@@ -582,6 +594,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
 
             int id = player->ID;
             RemotePeers[id] = nullptr;
+            ConnectingSince[id] = 0;
 
             player->ID = 0;
             player->Status = Player_None;
@@ -627,6 +640,7 @@ void LAN::ProcessHostEvent(ENetEvent& event)
                     player.Status = Player_Client;
                     player.Address = event.peer->address.host;
                     memcpy(hostside, &player, sizeof(Player));
+                    ConnectingSince[hostside->ID] = 0;   // handshake complete
 
                     Platform::Mutex_Unlock(PlayersMutex);
 
@@ -858,7 +872,11 @@ void LAN::ProcessLANAsync(int type)
                 header->Magic = (u32)Platform::GetMSCount();
                 event.packet->userData = event.peer;
 
-                if (header->Type == 0)
+                if ((header->Type & 0xFFFF) >= 4)
+                {
+                    RXQueueBridge.push(event.packet);
+                }
+                else if (header->Type == 0)
                 {
                     RXQueue.push(event.packet);
                     if (type == 1) return;
@@ -950,6 +968,13 @@ void LAN::ProcessLAN(int type)
                 header->Magic = (u32)Platform::GetMSCount();
 
                 event.packet->userData = event.peer;
+
+                if ((header->Type & 0xFFFF) >= 4)
+                {
+                    // fork-bridge frame: own queue, keep servicing
+                    RXQueueBridge.push(event.packet);
+                    continue;
+                }
                 RXQueue.push(event.packet);
 
                 // return now -- if we are receiving MP frames, if we keep going
@@ -996,6 +1021,28 @@ void LAN::Process()
             Players[i].Ping = RemotePeers[i]->roundTripTime;
         }
 
+        // Host: reap slots that connected but never finished the handshake
+        // within 10 s (client CPU-starved past its connect timeout, crashed,
+        // or reset silently).  Without this the slot stays Player_Connecting,
+        // NumPlayers stays inflated, and every retry from that player — or a
+        // later one filling the gap — gets rejected as "game full".
+        if (IsHost)
+        {
+            u32 now = (u32)Platform::GetMSCount();
+            for (int i = 1; i < 16; i++)
+            {
+                if (Players[i].Status != Player_Connecting) continue;
+                if (ConnectingSince[i] == 0) continue;
+                if ((now - ConnectingSince[i]) < 10000) continue;
+
+                if (RemotePeers[i]) { enet_peer_disconnect_now(RemotePeers[i], 0); RemotePeers[i] = nullptr; }
+                Players[i].Status = Player_None;
+                ConnectingSince[i] = 0;
+                if (NumPlayers > 0) NumPlayers--;
+                ConnectedBitmask &= ~(1 << i);
+            }
+        }
+
         Platform::Mutex_Unlock(PlayersMutex);
     }
 }
@@ -1030,9 +1077,10 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
 {
     if (!Host) return 0;
 
-    // TODO make the reliable part optional?
-    //u32 flags = ENET_PACKET_FLAG_RELIABLE;
-    u32 flags = ENET_PACKET_FLAG_UNSEQUENCED;
+    // bridge frames (type >= 4) need reliable+ordered delivery; game MP
+    // frames stay unsequenced as before
+    u32 flags = ((type & 0xFFFF) >= 4) ? (u32)ENET_PACKET_FLAG_RELIABLE
+                                       : (u32)ENET_PACKET_FLAG_UNSEQUENCED;
 
     ENetPacket* enetpacket = enet_packet_create(nullptr, sizeof(MPPacketHeader)+len, flags);
 
@@ -1053,6 +1101,24 @@ int LAN::SendPacketGeneric(u32 type, u8* packet, int len, u64 timestamp)
     enet_host_flush(Host);
 
     return len;
+}
+
+int LAN::BridgeRecv(u8* buf, int maxlen)
+{
+    if (!Host) return 0;
+
+    ProcessLAN(0);
+    if (RXQueueBridge.empty()) return 0;
+
+    ENetPacket* enetpacket = RXQueueBridge.front();
+    RXQueueBridge.pop();
+    MPPacketHeader* header = (MPPacketHeader*)&enetpacket->data[0];
+
+    u32 len = header->Length;
+    if (len > (u32)maxlen) len = (u32)maxlen;
+    memcpy(buf, &enetpacket->data[sizeof(MPPacketHeader)], len);
+    enet_packet_destroy(enetpacket);
+    return (int)len;
 }
 
 int LAN::RecvPacketGeneric(u8* packet, bool block, u64* timestamp)
