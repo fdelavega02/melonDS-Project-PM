@@ -996,6 +996,7 @@ void BridgePump(melonDS::NDS* nds)
     {
         u8 rx[2100];
         u32 n;
+        static melonDS::u8 sGameEver[5] = {0,0,0,0,0};   // ever game-active latch (strictness)
         for (int pi = 0; pi < 3; pi++)
         while ((n = mpnet::gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
         {
@@ -1026,6 +1027,7 @@ void BridgePump(melonDS::NDS* nds)
                 }
             }
             gBr.roleSeenAt[r] = gBr.frame;
+            sGameEver[r] = 1;   // latch: this role has been game-active this session
 
             // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
             // import block / party buffer only accepts the CHOSEN pair
@@ -1036,10 +1038,25 @@ void BridgePump(melonDS::NDS* nds)
             // update.
             if (tag == 1 && sz == gBr.blkSize && n >= 4 + sz + 48)
             {
+                // STRICT 3+ ROUTING (4P same-trainer fix, ported from the
+                // DeSmuME bridge): with two or more fresh peers the legacy
+                // pairwise import only accepts the CHOSEN partner — the old
+                // "pairRole 0 accepts everyone, last writer wins" open door
+                // let a mid-battle pair's per-turn broadcasts (same
+                // trainerHash) hijack a still-unpaired third player's entry
+                // stall.  Unpaired in 3+ receives nothing and keeps waiting
+                // for the real partner; plain 2P keeps the open door.
                 melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
+                // Ever-game-active latch, NOT recent traffic: mid-battle
+                // peers freeze their exports and an aging count re-opened
+                // the legacy door exactly while a pair fought (4P bug).
+                int gamePeers = 0;
+                for (int gr = 1; gr <= 4; gr++)
+                    if (gr != myRole && sGameEver[gr]) gamePeers++;
+                bool strict = (gamePeers >= 2);
                 rx[4 + 0x12] = (melonDS::u8)r;   // stamp playerRole (old-hub duty;
                                                  // MpPartnerIsLead dead without it)
-                if (pairRole == 0 || r == (int)pairRole)
+                if ((pairRole == 0 && !strict) || r == (int)pairRole)
                     memcpy(apPtr(nds, gBr.importBlk), rx + 4, sz);
                 if (gBr.blkN) memcpy(apPtr(nds, gBr.blkN + (r-1)*sz), rx + 4, sz);
                 memcpy(apPtr(nds, gBr.owImp + (r-1)*48), rx + 4 + sz, 48);
@@ -1047,7 +1064,14 @@ void BridgePump(melonDS::NDS* nds)
             else if (tag == 2 && sz == gBr.partySize)
             {
                 melonDS::u8 pairRole = apRd8(nds, gBr.owExp + 0x18);
-                if (pairRole == 0 || r == (int)pairRole)
+                // Ever-game-active latch, NOT recent traffic: mid-battle
+                // peers freeze their exports and an aging count re-opened
+                // the legacy door exactly while a pair fought (4P bug).
+                int gamePeers = 0;
+                for (int gr = 1; gr <= 4; gr++)
+                    if (gr != myRole && sGameEver[gr]) gamePeers++;
+                bool strict = (gamePeers >= 2);
+                if ((pairRole == 0 && !strict) || r == (int)pairRole)
                     memcpy(apPtr(nds, gBr.partyImp), rx + 4, sz);
                 if (gBr.partyN) memcpy(apPtr(nds, gBr.partyN + (r-1)*sz), rx + 4, sz);
             }
@@ -1057,6 +1081,40 @@ void BridgePump(melonDS::NDS* nds)
                 gBr.dbgPktRx++;
             }
         }
+    }
+
+    // PAIR REBIND / GHOST PURGE (ported from the DeSmuME bridge).  On a
+    // pairRole change to a REAL role, replay that role's latest cached
+    // block/party from the always-updated per-role arrays.  A change to 0
+    // is left ALONE: the ROM's pair re-validate briefly flaps pairRole to 0
+    // when the partner's conversion window closes and re-courts mutually the
+    // next scan tick -- zeroing here killed the P3+P4 conversion
+    // mid-handshake.  The stale ex-partner hazard is handled where it bites:
+    // when OUR OWN battle ends (export inBattle 1->0) the import's magic
+    // dies, so a frozen mid-battle partner block can't convert a later one.
+    if (gBr.owExp && gBr.importBlk)
+    {
+        static melonDS::u8 sLastPairRole = 0xFF;
+        melonDS::u8 pr = apRd8(nds, gBr.owExp + 0x18);
+        if (pr != sLastPairRole)
+        {
+            sLastPairRole = pr;
+            if (pr >= 1 && pr <= 4)
+            {
+                if (gBr.blkN)
+                    memcpy(apPtr(nds, gBr.importBlk), apPtr(nds, gBr.blkN + (pr-1)*gBr.blkSize), gBr.blkSize);
+                if (gBr.partyN && gBr.partyImp)
+                    memcpy(apPtr(nds, gBr.partyImp), apPtr(nds, gBr.partyN + (pr-1)*gBr.partySize), gBr.partySize);
+            }
+        }
+    }
+    if (gBr.exportBlk && gBr.importBlk)
+    {
+        static melonDS::u8 sLastOwnInBattle = 0;
+        melonDS::u8 ib = apRd8(nds, gBr.exportBlk + 0x10);
+        if (!ib && sLastOwnInBattle)
+            apWr32(nds, gBr.importBlk, 0);   // battle over: purge partner-block ghost
+        sLastOwnInBattle = ib;
     }
 
     if ((gBr.frame % 120) == 0)
