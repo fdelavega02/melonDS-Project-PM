@@ -20,6 +20,8 @@
     // must precede any windows.h (pulled in by SDL) to get winsock2, not winsock1
     #include <winsock2.h>
     #include <ws2tcpip.h>
+    #include <shellapi.h>
+    #include <wctype.h>
 #endif
 
 #include <stdlib.h>
@@ -624,6 +626,92 @@ namespace mpnet
 const int PORT = 7820;
 const melonDS::u32 MAXFRAME = 8192;
 
+#ifdef _WIN32
+// Windows Firewall helper for hosting (same scheme as the DeSmuME fork's
+// mp_bridge.cpp).  Router port-forwarding alone can't make a host reachable:
+// inbound traffic must also pass this PC's own firewall, and declining the
+// first-launch security alert leaves a permanent block rule for the exe.
+// A melonDS host needs BOTH its native LAN port (UDP 7064 + discovery) and
+// the bridge port (TCP 7820) open, so the rule is program-scoped.  When our
+// rule is absent we ASK the player, then run the standard netsh repair
+// visibly with one admin prompt.
+const wchar_t* FW_RULE = L"melonDS (Project PM)";
+
+static void fwLower(std::wstring& s)
+{
+    for (size_t i = 0; i < s.size(); i++) s[i] = towlower(s[i]);
+}
+
+static bool fwRulePresent(const wchar_t* exe)
+{
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+        L"SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules",
+        0, KEY_READ, &k) != ERROR_SUCCESS) return false;
+
+    // rule values are pipe-delimited token strings: v2.x|Action=Allow|...|App=path|...|Name=...|
+    std::wstring wantName = L"|name="; wantName += FW_RULE; wantName += L"|";
+    std::wstring wantApp  = L"|app=";  wantApp  += exe;     wantApp  += L"|";
+    fwLower(wantName); fwLower(wantApp);
+
+    bool found = false;
+    wchar_t name[256]; BYTE data[4096];
+    for (DWORD i = 0; !found; i++)
+    {
+        DWORD nl = 256, dl = sizeof(data) - 2, type = 0;
+        LONG r = RegEnumValueW(k, i, name, &nl, NULL, &type, data, &dl);
+        if (r == ERROR_NO_MORE_ITEMS) break;
+        if (r != ERROR_SUCCESS || type != REG_SZ) continue;
+        data[dl] = 0; data[dl + 1] = 0;
+        std::wstring v((const wchar_t*)data);
+        fwLower(v);
+        found = v.find(wantName) != std::wstring::npos
+             && v.find(wantApp)  != std::wstring::npos
+             && v.find(L"|action=allow|") != std::wstring::npos
+             && v.find(L"|dir=in|")       != std::wstring::npos
+             && v.find(L"|active=true|")  != std::wstring::npos;
+    }
+    RegCloseKey(k);
+    return found;
+}
+
+static void ensureFirewall()
+{
+    static bool once = false;
+    if (once) return;
+    once = true;
+    if (getenv("MELONDS_AP")) return;   // automated harness instances: no prompts
+
+    wchar_t exe[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (!n || n >= MAX_PATH) return;
+
+    if (fwRulePresent(exe)) { printf("[BR] firewall rule ok\n"); return; }
+
+    if (MessageBoxW(NULL,
+        L"To let friends join your hosted game, Windows Firewall needs an\n"
+        L"inbound rule for this emulator (without it, players outside your\n"
+        L"PC usually can't connect even with the ports forwarded).\n\n"
+        L"Add the rule now?  Windows will show one administrator prompt.",
+        L"Project PM - enable hosting", MB_YESNO | MB_ICONQUESTION) != IDYES)
+    {
+        printf("[BR] firewall rule declined by user\n");
+        return;
+    }
+
+    wchar_t args[1200];
+    swprintf(args, 1200,
+        L"/c netsh advfirewall firewall delete rule name=all program=\"%ls\" & "
+        L"netsh advfirewall firewall add rule name=\"%ls\" dir=in action=allow "
+        L"program=\"%ls\" enable=yes profile=any", exe, FW_RULE, exe);
+    HINSTANCE rc = ShellExecuteW(NULL, L"runas", L"cmd.exe", args, NULL, SW_SHOWMINNOACTIVE);
+    printf("[BR] firewall rule %s\n",
+        ((INT_PTR)rc > 32) ? "repair launched" : "not added (admin prompt declined)");
+}
+#else
+static void ensureFirewall() {}
+#endif
+
 struct Peer
 {
     SOCKET s = INVALID_SOCKET;
@@ -657,6 +745,7 @@ struct Net
 
     void startHost()
     {
+        ensureFirewall();
         WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
         mode = 1; started = true;
         listener = socket(AF_INET, SOCK_STREAM, 0);
