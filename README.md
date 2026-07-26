@@ -22,7 +22,7 @@ The goal is to do things right and fast, akin to blargSNES (but hopefully better
 This branch (`platinum-mp`) carries the embedded multiplayer bridge for
 **Project PM**, a co-op multiplayer romhack of Pokémon Platinum. Hosting or
 joining a LAN game also syncs the romhack's multiplayer mailboxes with the
-other players, including players on the sibling
+other players. The sibling DeSmuME port of the same bridge lives at
 [DeSmuME bridge](https://github.com/ComicartOlie/Desmume-Project-PM).
 All credit for the emulator itself goes to the melonDS team.
 
