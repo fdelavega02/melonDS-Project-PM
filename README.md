@@ -17,6 +17,37 @@ DS emulator, sorta
 The goal is to do things right and fast, akin to blargSNES (but hopefully better). But also to, you know, have a fun challenge :)
 <hr>
 
+## Project PM fork
+
+The [`platinum-mp`](https://github.com/ComicartOlie/melonDS-Project-PM/tree/platinum-mp)
+branch carries the embedded multiplayer bridge for
+**Project PM**, a co-op multiplayer romhack of Pokémon Platinum. Hosting or
+joining a LAN game also syncs the romhack's multiplayer mailboxes with the
+other players. The sibling DeSmuME port of the same bridge lives at
+[DeSmuME bridge](https://github.com/ComicartOlie/Desmume-Project-PM).
+All credit for the emulator itself goes to the melonDS team.
+
+### Hosting over the internet
+
+One player hosts ("Host LAN game" in melonDS's Multiplayer menu); everyone
+else joins with the host's IP. On the same LAN or a VPN (Hamachi, Radmin,
+ZeroTier, Tailscale) this works with no setup. To host over the open
+internet, three things must all be true on the **host's** side. Joiners
+never need any of this:
+
+1. **Router port forwards**: melonDS needs **two** ports forwarded to the
+   host PC: **UDP 7064** (melonDS's LAN session) and **TCP 7820** (the mod's
+   sync bridge). Forwarding only 7820 is the most common mistake; the
+   session can never form without 7064.
+2. **Windows Firewall**: the router forwards the connection, but Windows
+   still has to accept it. The first time you host, the emulator offers to
+   add the firewall rule for you (one admin prompt, one time). Say yes.
+3. **A real public IP**: if your router's WAN address (in its admin page)
+   is different from what whatismyip.com shows, or starts with
+   100.64-100.127, your ISP has you behind CGNAT and no amount of port
+   forwarding will work. Use a VPN like Hamachi/ZeroTier, or have a friend
+   with a real IP host.
+
 ## How to use
 
 Firmware boot (not direct boot) requires a BIOS/firmware dump from an original DS or DS Lite.
