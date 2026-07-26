@@ -19,7 +19,8 @@ The goal is to do things right and fast, akin to blargSNES (but hopefully better
 
 ## Project PM fork
 
-This branch (`platinum-mp`) carries the embedded multiplayer bridge for
+The [`platinum-mp`](https://github.com/ComicartOlie/melonDS-Project-PM/tree/platinum-mp)
+branch carries the embedded multiplayer bridge for
 **Project PM**, a co-op multiplayer romhack of Pokémon Platinum. Hosting or
 joining a LAN game also syncs the romhack's multiplayer mailboxes with the
 other players. The sibling DeSmuME port of the same bridge lives at
