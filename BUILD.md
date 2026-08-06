@@ -13,17 +13,22 @@
      * Older versions: `sudo apt install qtbase5-dev qtbase5-private-dev qtmultimedia5-dev libqt5svg5-dev`  
        Also add `-DUSE_QT6=OFF` to the first CMake command below.
    * Fedora: `sudo dnf install gcc-c++ cmake extra-cmake-modules SDL2-devel libarchive-devel enet-devel libzstd-devel faad2-devel qt6-{qtbase,qtbase-private,qtmultimedia,qtsvg}-devel wayland-devel`
-   * Arch Linux: `sudo pacman -S base-devel cmake extra-cmake-modules git libpcap sdl2 qt6-{base,multimedia,svg} libarchive enet zstd faad2`
+   * Arch Linux / CachyOS: `sudo pacman -S --needed base-devel cmake ninja extra-cmake-modules git libpcap sdl2 qt6-{base,multimedia,svg} libarchive enet zstd faad2`
 2. Download the melonDS repository and prepare:
    ```bash
-   git clone https://github.com/melonDS-emu/melonDS
-   cd melonDS
+   git clone --branch linux-native --single-branch https://github.com/fdelavega02/melonDS-Project-PM.git
+   cd melonDS-Project-PM
    ```
 3. Compile:
    ```bash
-   cmake -B build
+   cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DMELONDS_EMBED_BUILD_INFO=ON
    cmake --build build -j$(nproc --all)
    ```
+
+   The native executable is `build/melonDS`. To make the distributable
+   AppImage used by this fork's GitHub Releases, use the `Linux AppImage`
+   workflow in GitHub Actions; it runs on Ubuntu 22.04 and bundles the Qt
+   runtime with linuxdeploy.
 
 ## Windows
 1. Install [MSYS2](https://www.msys2.org/)
