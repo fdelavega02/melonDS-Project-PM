@@ -19,6 +19,19 @@ The goal is to do things right and fast, akin to blargSNES (but hopefully better
 
 ## Project PM fork
 
+This fork publishes a native Linux x86_64 AppImage for the Project PM build.
+Download it from the repository's **Releases** page, mark it executable, and
+launch it:
+
+```sh
+chmod +x melonDS*.AppImage
+./melonDS*.AppImage
+```
+
+The Linux builds come from the `platinum-mp` branch, which contains the same
+Project PM multiplayer bridge as the upstream Windows release. Tags beginning
+with `project-pm-linux-v` create a GitHub Release with the AppImage attached.
+
 The [`platinum-mp`](https://github.com/ComicartOlie/melonDS-Project-PM/tree/platinum-mp)
 branch carries the embedded multiplayer bridge for
 **Project PM**, a co-op multiplayer romhack of Pokémon Platinum. Hosting or

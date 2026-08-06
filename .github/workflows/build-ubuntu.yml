@@ -1,13 +1,17 @@
-name: Ubuntu
+name: Linux AppImage
 
 on:
   push:
     branches:
-      - master
+      - platinum-mp
+      - linux-native
       - ci/*
+    tags:
+      - project-pm-linux-v*
   pull_request:
     branches:
-      - master
+      - platinum-mp
+  workflow_dispatch:
 
 env:
   MELONDS_GIT_BRANCH: ${{ github.ref }}
@@ -15,19 +19,13 @@ env:
   MELONDS_BUILD_PROVIDER: GitHub Actions
 #  MELONDS_VERSION_SUFFIX: " RC"
 
+permissions:
+  contents: write
+
 jobs:
   build:
-    continue-on-error: true
-    strategy:
-      matrix:
-        arch:
-          - runner: ubuntu-22.04
-            name: x86_64
-          - runner: ubuntu-22.04-arm
-            name: aarch64
-
-    name: ${{ matrix.arch.name }}
-    runs-on: ${{ matrix.arch.runner }}
+    name: x86_64
+    runs-on: ubuntu-22.04
 
     steps:
     - uses: actions/checkout@v6
@@ -45,12 +43,12 @@ jobs:
         DESTDIR=AppDir cmake --install build
     - uses: actions/upload-artifact@v7
       with:
-        name: melonDS-ubuntu-${{ matrix.arch.name }}
+        name: melonDS-ubuntu-x86_64
         path: AppDir/usr/bin/melonDS
     - name: Fetch AppImage tools
       run: |
-        wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch.name }}.AppImage
-        wget https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${{ matrix.arch.name }}.AppImage
+        wget https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+        wget https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
         chmod a+x linuxdeploy-*.AppImage
     - name: Build the AppImage
       env:
@@ -58,9 +56,14 @@ jobs:
         EXTRA_QT_PLUGINS: waylandcompositor
         QMAKE: /usr/lib/qt6/bin/qmake
       run: |
-        ./linuxdeploy-${{ matrix.arch.name }}.AppImage --appdir AppDir --plugin qt --output appimage
+        ./linuxdeploy-x86_64.AppImage --appdir AppDir --plugin qt --output appimage
     - uses: actions/upload-artifact@v7
       with:
-        name: melonDS-appimage-${{ matrix.arch.name }}
+        name: melonDS-ProjectPM-linux-x86_64.AppImage
         path: melonDS*.AppImage
         archive: false
+    - name: Publish AppImage to the tagged release
+      if: startsWith(github.ref, 'refs/tags/project-pm-linux-v')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: melonDS*.AppImage
