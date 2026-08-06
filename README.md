@@ -46,6 +46,32 @@ other players. The sibling DeSmuME port of the same bridge lives at
 [DeSmuME bridge](https://github.com/ComicartOlie/Desmume-Project-PM).
 All credit for the emulator itself goes to the melonDS team.
 
+### Prepare a Project PM ROM
+
+Project PM is a patch for Pokémon Platinum. The Project PM multiplayer bridge
+works with the **patched** game, not with an unmodified Platinum ROM. Obtain a
+clean ROM by dumping a copy of the game you own, then apply the Project PM
+`.xdelta` patch supplied by the Project PM project.
+
+On CachyOS, install `xdelta3` and place the clean ROM and patch in the same
+directory. The following example uses simple filenames to avoid shell quoting
+problems:
+
+```fish
+sudo pacman -S --needed xdelta3
+mkdir -p ~/Games/Project-PM
+cd ~/Games/Project-PM
+# Copy your legally dumped base ROM here as: Pokemon Platinum.nds
+# Copy the Project PM patch here as: project-pm.xdelta
+xdelta3 -d -s "Pokemon Platinum.nds" project-pm.xdelta "Project PM Multiplayer.nds"
+```
+
+`-d` tells xdelta3 to decode/apply the patch. `-s` selects the clean base ROM,
+and the final filename is the new patched ROM. Open `Project PM
+Multiplayer.nds` in melonDS. If xdelta3 reports that the source file does not
+match, do not force it: the base ROM is the wrong regional release or revision
+for that patch. Use the exact base ROM specified with the Project PM patch.
+
 ### Hosting over the internet
 
 One player hosts ("Host LAN game" in melonDS's Multiplayer menu); everyone
