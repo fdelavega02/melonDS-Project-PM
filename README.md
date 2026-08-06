@@ -52,9 +52,9 @@ never need any of this:
    host PC: **UDP 7064** (melonDS's LAN session) and **TCP 7820** (the mod's
    sync bridge). Forwarding only 7820 is the most common mistake; the
    session can never form without 7064.
-2. **Windows Firewall**: the router forwards the connection, but Windows
-   still has to accept it. The first time you host, the emulator offers to
-   add the firewall rule for you (one admin prompt, one time). Say yes.
+2. **Linux firewall**: if a firewall is enabled on the host, allow both
+   **UDP 7064** and **TCP 7820**. For example, with UFW:
+   `sudo ufw allow 7064/udp` and `sudo ufw allow 7820/tcp`.
 3. **A real public IP**: if your router's WAN address (in its admin page)
    is different from what whatismyip.com shows, or starts with
    100.64-100.127, your ISP has you behind CGNAT and no amount of port
