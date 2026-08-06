@@ -7,10 +7,7 @@
 <a href="https://kiwiirc.com/client/irc.badnik.net/?nick=IRC-Source_?#melonds" alt="IRC channel: #melonds"><img src="https://img.shields.io/badge/IRC%20chat-%23melonds-%23dd2e44.svg"></a>
 <a href="https://discord.gg/pAMAtExcqV" alt="Discord"><img src="https://img.shields.io/badge/Discord-Kuribo64-7289da?logo=discord&logoColor=white"></a>
 <br>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-windows.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-windows.yml/badge.svg" /></a>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-ubuntu.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-ubuntu.yml/badge.svg" /></a>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-macos.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-macos.yml/badge.svg" /></a>
-<a href="https://github.com/melonDS-emu/melonDS/actions/workflows/build-bsd.yml?query=event%3Apush"><img src="https://github.com/melonDS-emu/melonDS/actions/workflows/build-bsd.yml/badge.svg" /></a>
+<a href="https://github.com/fdelavega02/melonDS-Project-PM/actions/workflows/build-ubuntu.yml?query=branch%3Alinux-native"><img src="https://github.com/fdelavega02/melonDS-Project-PM/actions/workflows/build-ubuntu.yml/badge.svg?branch=linux-native" alt="Linux AppImage build" /></a>
 </p>
 DS emulator, sorta
 
@@ -23,13 +20,18 @@ This is an in-progress community fork maintained by **M4doesstuff** and
 **Hermy**. Its goal is to make the Project PM multiplayer build of melonDS
 available as a native Linux x86_64 AppImage, rather than requiring Wine.
 
-Download the current native Linux build from the repository's **Releases**
-page, mark the AppImage executable, and launch it:
+Download the current native Linux build from the repository's
+[Releases](https://github.com/fdelavega02/melonDS-Project-PM/releases) page.
+On CachyOS, install `fuse2`, mark the AppImage executable, and launch it:
 
-```sh
+```fish
+sudo pacman -S --needed fuse2
 chmod +x melonDS*.AppImage
 ./melonDS*.AppImage
 ```
+
+If AppImage mounting is unavailable, use
+`APPIMAGE_EXTRACT_AND_RUN=1 ./melonDS*.AppImage` instead.
 
 The `linux-native` branch is this fork's default branch and is the source of
 the published Linux builds. It contains the Project PM multiplayer bridge from

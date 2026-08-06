@@ -1,86 +1,63 @@
-# Building melonDS
+# Building the Linux Project PM fork
 
-* [Linux](#linux)
-* [Windows](#windows)
-* [macOS](#macos)
+This fork supports native **Linux x86_64** builds. Its default branch,
+`linux-native`, includes the Project PM multiplayer bridge and is the source
+for the published AppImage releases.
 
-## Linux
-1. Install dependencies:
-   * Ubuntu:
-     * All versions: `sudo apt install cmake extra-cmake-modules libcurl4-gnutls-dev libpcap0.8-dev libsdl2-dev libarchive-dev libenet-dev libzstd-dev libfaad-dev`
-     * 24.04: `sudo apt install qt6-{base,base-private,multimedia,svg}-dev`
-     * 22.04: `sudo apt install qtbase6-dev qtbase6-private-dev qtmultimedia6-dev libqt6svg6-dev`
-     * Older versions: `sudo apt install qtbase5-dev qtbase5-private-dev qtmultimedia5-dev libqt5svg5-dev`  
-       Also add `-DUSE_QT6=OFF` to the first CMake command below.
-   * Fedora: `sudo dnf install gcc-c++ cmake extra-cmake-modules SDL2-devel libarchive-devel enet-devel libzstd-devel faad2-devel qt6-{qtbase,qtbase-private,qtmultimedia,qtsvg}-devel wayland-devel`
-   * Arch Linux / CachyOS: `sudo pacman -S --needed base-devel cmake ninja extra-cmake-modules git libpcap sdl2 qt6-{base,multimedia,svg} libarchive enet zstd faad2`
-2. Download the melonDS repository and prepare:
-   ```bash
+## CachyOS / Arch Linux
+
+1. Install the build dependencies:
+
+   ```fish
+   sudo pacman -S --needed base-devel cmake ninja extra-cmake-modules git libpcap sdl2 qt6-{base,multimedia,svg} libarchive enet zstd faad2
+   ```
+
+2. Clone the fork and enter it:
+
+   ```fish
    git clone --branch linux-native --single-branch https://github.com/fdelavega02/melonDS-Project-PM.git
    cd melonDS-Project-PM
    ```
-3. Compile:
-   ```bash
-   cmake -B build -G Ninja -DCMAKE_INSTALL_PREFIX=/usr -DMELONDS_EMBED_BUILD_INFO=ON
-   cmake --build build -j$(nproc --all)
+
+3. Configure and compile a release build:
+
+   ```fish
+   cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DMELONDS_EMBED_BUILD_INFO=ON
+   cmake --build build -j (nproc)
    ```
 
-   The native executable is `build/melonDS`. To make the distributable
-   AppImage used by this fork's GitHub Releases, use the `Linux AppImage`
-   workflow in GitHub Actions; it runs on Ubuntu 22.04 and bundles the Qt
-   runtime with linuxdeploy.
+4. Launch it:
 
-## Windows
-1. Install [MSYS2](https://www.msys2.org/)
-2. Open the MSYS2 terminal from the Start menu:
-   * For x64 systems (most common), use **MSYS2 UCRT64**
-   * For ARM64 systems, use **MSYS2 CLANGARM64**
-3. Update the packages using `pacman -Syu` and reopen the same terminal if it asks you to
-4. Install git and clone the repository
-   ```bash
-   pacman -S git
-   git clone https://github.com/melonDS-emu/melonDS
-   cd melonDS
+   ```fish
+   ./build/melonDS
    ```
-5. Install dependencies:  
-   Replace `<prefix>` below with `mingw-w64-ucrt-x86_64` on x64 systems, or `mingw-w64-clang-aarch64` on ARM64 systems.
-   ```bash
-   pacman -S <prefix>-{toolchain,cmake,SDL2,libarchive,enet,zstd,faad2}
-   ```
-6. Install Qt and configure the build directory
-   * Dynamic builds (with DLLs)
-     1. Install Qt: `pacman -S <prefix>-{qt6-base,qt6-svg,qt6-multimedia,qt6-svg,qt6-tools}`
-     2. Set up the build directory with `cmake -B build`
-   * Static builds (without DLLs, standalone executable)
-     1. Install Qt: `pacman -S <prefix>-qt5-static`  
-        (Note: As of writing, the `qt6-static` package does not work.)
-     2. Set up the build directory with `cmake -B build -DBUILD_STATIC=ON -DUSE_QT6=OFF -DCMAKE_PREFIX_PATH=$MSYSTEM_PREFIX/qt5-static`
-7. Compile: `cmake --build build`
 
-If everything went well, melonDS should now be in the `build` folder. For dynamic builds, you may need to run melonDS from the MSYS2 terminal in order for it to find the required DLLs.
+## Other Linux distributions
 
-## macOS
-1. Install the [Homebrew Package Manager](https://brew.sh)
-2. Install dependencies: `brew install git pkg-config cmake sdl2 qt@6 libarchive enet zstd faad2`
-3. Download the melonDS repository and prepare:
-   ```zsh
-   git clone https://github.com/melonDS-emu/melonDS
-   cd melonDS
-   ```
-4. Compile:
-   ```zsh
-   cmake -B build -DCMAKE_PREFIX_PATH="$(brew --prefix qt@6);$(brew --prefix libarchive)"
-   cmake --build build -j$(sysctl -n hw.logicalcpu)
-   ```
-If everything went well, melonDS.app should now be in the `build` directory.
+Install a C++ toolchain, CMake, Ninja, Extra CMake Modules, SDL2, Qt 6
+(Base, Multimedia, and SVG), libpcap, libarchive, ENet, zstd, and FAAD2 using
+your distribution's package manager. Then use the same clone, configure, and
+build commands above. On Debian/Ubuntu, the corresponding development packages
+are used by the repository's Ubuntu 22.04 AppImage workflow.
 
-### Self-contained app bundle
-If you want an app bundle that can be distributed to other computers without needing to install dependencies through Homebrew, you can additionally run `
-../tools/mac-libs.rb .` after the build is completed, or add `-DMACOS_BUNDLE_LIBS=ON` to the first CMake command.
+## AppImage releases
 
-## Nix (macOS/Linux)
+If you only want to play, download the Linux x86_64 AppImage from
+[Releases](https://github.com/fdelavega02/melonDS-Project-PM/releases). On
+CachyOS, install `fuse2`, mark the file executable, and launch it:
 
-melonDS provides a Nix flake with support for both macOS and Linux. The [Nix package manager](https://nixos.org) needs to be installed to use it.
+```fish
+sudo pacman -S --needed fuse2
+chmod +x melonDS-Project-PM-linux-x86_64.AppImage
+./melonDS-Project-PM-linux-x86_64.AppImage
+```
 
-* To run melonDS, just type `nix run github:melonDS-emu/melonDS`.
-* To get a shell for development, clone the melonDS repository and type `nix develop` in its directory.
+If AppImage mounting is unavailable, use:
+
+```fish
+APPIMAGE_EXTRACT_AND_RUN=1 ./melonDS-Project-PM-linux-x86_64.AppImage
+```
+
+The `Linux AppImage` GitHub Actions workflow builds and validates the
+distributable AppImage on every push to `linux-native`. Tags named
+`project-pm-linux-v*` publish the generated AppImage to a GitHub release.
