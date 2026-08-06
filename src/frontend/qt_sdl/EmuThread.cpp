@@ -22,6 +22,15 @@
     #include <ws2tcpip.h>
     #include <shellapi.h>
     #include <wctype.h>
+#else
+    #include <arpa/inet.h>
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <netinet/in.h>
+    #include <netinet/tcp.h>
+    #include <sys/socket.h>
+    #include <sys/types.h>
+    #include <unistd.h>
 #endif
 
 #include <stdlib.h>
@@ -626,6 +635,27 @@ namespace mpnet
 const int PORT = 7820;
 const melonDS::u32 MAXFRAME = 8192;
 
+#ifndef _WIN32
+using SOCKET = int;
+constexpr SOCKET INVALID_SOCKET = -1;
+constexpr int SOCKET_ERROR = -1;
+
+static int closesocket(SOCKET s)
+{
+    return close(s);
+}
+
+static bool socketWouldBlock(int error)
+{
+    return error == EAGAIN || error == EWOULDBLOCK || error == EINPROGRESS;
+}
+#else
+static bool socketWouldBlock(int error)
+{
+    return error == WSAEWOULDBLOCK;
+}
+#endif
+
 #ifdef _WIN32
 // Windows Firewall helper for hosting (same scheme as the DeSmuME fork's
 // mp_bridge.cpp).  Router port-forwarding alone can't make a host reachable:
@@ -739,19 +769,32 @@ struct Net
 
     static void setNonBlock(SOCKET s)
     {
+#ifdef _WIN32
         u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
         BOOL nd = TRUE; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
+#else
+        int flags = fcntl(s, F_GETFL, 0);
+        if (flags >= 0) fcntl(s, F_SETFL, flags | O_NONBLOCK);
+        int nd = 1; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &nd, sizeof(nd));
+#endif
     }
 
     void startHost()
     {
         ensureFirewall();
+#ifdef _WIN32
         WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+#endif
         mode = 1; started = true;
         listener = socket(AF_INET, SOCK_STREAM, 0);
         if (listener == INVALID_SOCKET) { mode = 0; return; }
+#ifdef _WIN32
         BOOL yes = TRUE;
         setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
+#else
+        int yes = 1;
+        setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+#endif
         sockaddr_in a; memset(&a, 0, sizeof(a));
         a.sin_family = AF_INET; a.sin_addr.s_addr = INADDR_ANY; a.sin_port = htons(PORT);
         if (bind(listener, (sockaddr*)&a, sizeof(a)) != 0 || listen(listener, 3) != 0)
@@ -764,7 +807,9 @@ struct Net
 
     void startJoin(const char* ip)
     {
+#ifdef _WIN32
         WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+#endif
         if (ip && ip[0]) { strncpy(joinIP, ip, sizeof(joinIP)-1); joinIP[sizeof(joinIP)-1] = 0; }
         mode = 2; started = true;
     }
@@ -780,13 +825,24 @@ struct Net
         {
             beaconTx = socket(AF_INET, SOCK_DGRAM, 0);
             if (beaconTx == INVALID_SOCKET) return;
+#ifdef _WIN32
             BOOL b = TRUE; setsockopt(beaconTx, SOL_SOCKET, SO_BROADCAST, (const char*)&b, sizeof(b));
+#else
+            int b = 1; setsockopt(beaconTx, SOL_SOCKET, SO_BROADCAST, &b, sizeof(b));
+#endif
         }
         if (frame - lastBeacon < 60) return;
         lastBeacon = frame;
         melonDS::u8 buf[32]; memset(buf, 0, sizeof(buf));
         memcpy(buf, "PLATMP", 6); buf[6] = 1; buf[7] = players;
-        char nm[24]; DWORD n = 24; if (!GetComputerNameA(nm, &n)) { strcpy(nm, "melonDS"); n = 7; }
+        char nm[24];
+#ifdef _WIN32
+        DWORD n = 24; if (!GetComputerNameA(nm, &n)) { strcpy(nm, "melonDS"); n = 7; }
+#else
+        size_t n = sizeof(nm) - 1;
+        if (gethostname(nm, n) != 0) { strcpy(nm, "melonDS"); n = 7; }
+        else { nm[n] = 0; n = strlen(nm); }
+#endif
         memcpy(buf + 8, nm, (n < 24) ? n : 23);
         sockaddr_in a; memset(&a, 0, sizeof(a));
         a.sin_family = AF_INET; a.sin_port = htons(7821); a.sin_addr.s_addr = INADDR_BROADCAST;
@@ -835,8 +891,20 @@ struct Net
                 fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex);
                 FD_SET(h.s, &wr); FD_SET(h.s, &ex);
                 timeval tv = {0,0};
-                int r = select(0, NULL, &wr, &ex, &tv);
-                if (r > 0 && FD_ISSET(h.s, &wr)) { h.up = true; connecting = false; freshPeer = true; printf("[BR] connected to %s\n", joinIP); }
+                int r = select(
+#ifdef _WIN32
+                    0,
+#else
+                    h.s + 1,
+#endif
+                    NULL, &wr, &ex, &tv);
+                int socketError = 0;
+#ifdef _WIN32
+                int socketErrorLen = sizeof(socketError);
+#else
+                socklen_t socketErrorLen = sizeof(socketError);
+#endif
+                if (r > 0 && FD_ISSET(h.s, &wr) && getsockopt(h.s, SOL_SOCKET, SO_ERROR, (char*)&socketError, &socketErrorLen) == 0 && socketError == 0) { h.up = true; connecting = false; freshPeer = true; printf("[BR] connected to %s\n", joinIP); }
                 else if (r > 0 && FD_ISSET(h.s, &ex)) { dropPeer(0); retryAt = frame + 120; }
             }
             else if (frame >= retryAt)
@@ -849,7 +917,13 @@ struct Net
                 inet_pton(AF_INET, joinIP, &a.sin_addr);
                 int r = ::connect(h.s, (sockaddr*)&a, sizeof(a));
                 if (r == 0) { h.up = true; freshPeer = true; printf("[BR] connected to %s\n", joinIP); }
-                else if (WSAGetLastError() == WSAEWOULDBLOCK) connecting = true;
+                else if (socketWouldBlock(
+#ifdef _WIN32
+                    WSAGetLastError()
+#else
+                    errno
+#endif
+                )) connecting = true;
                 else { dropPeer(0); retryAt = frame + 120; }
             }
         }
@@ -874,7 +948,13 @@ struct Net
         if (!p.up || p.tx.empty()) return;
         int r = ::send(p.s, (const char*)p.tx.data(), (int)p.tx.size(), 0);
         if (r > 0) p.tx.erase(p.tx.begin(), p.tx.begin() + r);
-        else if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) dropPeer(i);
+        else if (r == SOCKET_ERROR && !socketWouldBlock(
+#ifdef _WIN32
+            WSAGetLastError()
+#else
+            errno
+#endif
+        )) dropPeer(i);
     }
 
     void pumpRecv(int i)
@@ -887,7 +967,13 @@ struct Net
             int r = ::recv(p.s, tmp, sizeof(tmp), 0);
             if (r > 0) { p.rx.insert(p.rx.end(), tmp, tmp + r); if (p.rx.size() > 1024*1024) { dropPeer(i); return; } }
             else if (r == 0) { dropPeer(i); return; }
-            else { if (WSAGetLastError() != WSAEWOULDBLOCK) dropPeer(i); return; }
+            else { if (!socketWouldBlock(
+#ifdef _WIN32
+                WSAGetLastError()
+#else
+                errno
+#endif
+            )) dropPeer(i); return; }
         }
     }
 
