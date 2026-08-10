@@ -42,8 +42,12 @@ The [`platinum-mp`](https://github.com/ComicartOlie/melonDS-Project-PM/tree/plat
 branch carries the embedded multiplayer bridge for
 **Project PM**, a co-op multiplayer romhack of Pokémon Platinum. Hosting or
 joining a LAN game also syncs the romhack's multiplayer mailboxes with the
-other players. The sibling DeSmuME port of the same bridge lives at
-[DeSmuME bridge](https://github.com/ComicartOlie/Desmume-Project-PM).
+other players. The upstream sibling DeSmuME port of the same bridge lives at
+[ComicartOlie/Desmume-Project-PM](https://github.com/ComicartOlie/Desmume-Project-PM).
+For native Linux DeSmuME work, see [M4doesstuff's DeSmuME Project PM Linux
+port](https://github.com/fdelavega02/Desmume-Project-PM), on its default
+`linux-native` branch. It has native Host, Join, and Disconnect controls, and
+is still undergoing multiplayer testing.
 All credit for the emulator itself goes to the melonDS team.
 
 ### Prepare a Project PM ROM
