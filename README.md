@@ -47,7 +47,8 @@ other players. The upstream sibling DeSmuME port of the same bridge lives at
 For native Linux DeSmuME work, see [M4doesstuff's DeSmuME Project PM Linux
 port](https://github.com/fdelavega02/Desmume-Project-PM), on its default
 `linux-native` branch. It has native Host, Join, and Disconnect controls, and
-is still undergoing multiplayer testing.
+has passed both local multiplayer and a real remote internet multiplayer test
+through TCP 7820 port forwarding.
 All credit for the emulator itself goes to the melonDS team.
 
 ### Prepare a Project PM ROM
