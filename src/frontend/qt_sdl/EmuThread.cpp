@@ -22,6 +22,16 @@
     #include <ws2tcpip.h>
     #include <shellapi.h>
     #include <wctype.h>
+#else
+    #include <arpa/inet.h>
+    #include <errno.h>
+    #include <fcntl.h>
+    #include <netdb.h>
+    #include <netinet/in.h>
+    #include <netinet/tcp.h>
+    #include <sys/socket.h>
+    #include <sys/types.h>
+    #include <unistd.h>
 #endif
 
 #include <stdlib.h>
@@ -648,6 +658,7 @@ constexpr SOCKET INVALID_SOCKET = -1;
 constexpr int SOCKET_ERROR = -1;
 
 static int closesocket(SOCKET s) { return close(s); }
+static melonDS::u32 GetTickCount() { return SDL_GetTicks(); }
 static int socketLastError() { return errno; }
 static bool socketWouldBlock(int error)
 {
