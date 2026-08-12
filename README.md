@@ -79,11 +79,35 @@ for that patch. Use the exact base ROM specified with the Project PM patch.
 
 ### Hosting over the internet
 
-One player hosts ("Host LAN game" in melonDS's Multiplayer menu); everyone
-else joins with the host's IP. On the same LAN or a VPN (Hamachi, Radmin,
-ZeroTier, Tailscale) this works with no setup. To host over the open
-internet, three things must all be true on the **host's** side. Joiners
-never need any of this:
+The easy way is **online relay mode**: no port forwarding, no router setup,
+and nobody sees anyone else's IP address.
+
+One player picks **Host Online Game...** in melonDS's Multiplayer menu. The
+relay server field comes pre-set to the community relay, so just click
+through: the emulator shows a 5 character room code. Share the code, and
+everyone else picks **Join Online Game...** and enters it. Both sides dial
+*out* to the relay, which splices the two connections together, so it works
+from behind any normal router and from behind CGNAT. The room code stays on
+screen for the whole session.
+
+The relay only passes bytes through: it never sees your IP as anything more
+than a connection to itself, and players never exchange addresses with each
+other.
+
+The relay server software is a small open source Python script
+(`tools/relay/pm_relay.py` in the Project PM repo), so anyone can run their
+own. Tick **Custom Relay Server** in the Multiplayer menu and the online
+dialogs gain a relay server field; whatever you last used is remembered.
+
+#### LAN and direct IP (unchanged)
+
+On the same LAN or a VPN (Hamachi, Radmin, ZeroTier, Tailscale), one player
+hosts with "Host LAN game" and everyone else joins with the host's IP. That
+path works exactly as it always has and needs no setup.
+
+To host over the open internet **without** the relay (direct IP), three
+things must all be true on the **host's** side. Joiners never need any of
+this, and online relay mode needs none of it either:
 
 1. **Router port forwards**: melonDS needs **two** ports forwarded to the
    host PC: **UDP 7064** (melonDS's LAN session) and **TCP 7820** (the mod's
