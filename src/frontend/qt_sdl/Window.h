@@ -40,6 +40,8 @@
 
 class EmuInstance;
 class EmuThread;
+class QDialog;
+class QLabel;
 
 const int kMaxRecentROMs = 10;
 
@@ -133,6 +135,10 @@ private slots:
     void onMPNewInstance();
     void onLANStartHost();
     void onLANStartClient();
+    void onOnlineStartHost();
+    void onOnlineStartClient();
+    void onOnlineCustomRelay(bool checked);
+    void updateOnlineStatus();
     void onNPStartHost();
     void onNPStartClient();
     void onNPTest();
@@ -203,6 +209,16 @@ private:
 
     bool lanWarning(bool host);
 
+    // Online relay lobby: a modeless status window keeps the room code (the
+    // thing the host has to share) visible for the whole session.
+    void showOnlineStatus();
+    QString onlineDefaultName();
+    QString onlineRelayServer();
+    void onlineSaveRelay(const QString& srv);
+    QDialog* onlineStatusDlg = nullptr;
+    QLabel* onlineStatusLabel = nullptr;
+    QTimer* onlineStatusTimer = nullptr;
+
     bool showOSD;
 
     bool hasOGL;
@@ -257,6 +273,9 @@ public:
     QAction* actMPNewInstance;
     QAction* actLANStartHost;
     QAction* actLANStartClient;
+    QAction* actOnlineStartHost;
+    QAction* actOnlineStartClient;
+    QAction* actOnlineCustomRelay;
     QAction* actNPStartHost;
     QAction* actNPStartClient;
     QAction* actNPTest;

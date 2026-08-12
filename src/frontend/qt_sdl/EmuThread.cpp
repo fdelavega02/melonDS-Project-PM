@@ -32,6 +32,7 @@
 #include <optional>
 #include <thread>
 #include <chrono>
+#include <mutex>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -67,6 +68,7 @@
 #include "Savestate.h"
 
 #include "EmuInstance.h"
+#include "MpOnline.h"
 
 using namespace melonDS;
 
@@ -121,6 +123,9 @@ void EmuThread::detachWindow(MainWindow* window)
 // Scripted test autopilot + RAM telemetry (debug tooling, env-driven).
 //   MELONDS_AP=host|join      enable; pick LAN role
 //   MELONDS_AP_IP=<ip>        join target (default 127.0.0.1)
+//   MELONDS_AP_NOINPUT=1      transport only: never press a button or activate
+//                             wireless, so the ROM stays at the title screen
+//                             (lobby-level verification)
 // Drives the ROM through boot -> multiplayer activation, runs movement
 // patterns, and logs the game's own view of every player (positions read
 // straight out of emulated main RAM via the ROM's discovery block) to
@@ -188,6 +193,14 @@ melonDS::u32 apApply(melonDS::NDS* nds, melonDS::u32 maskIn)
     if (apMode < 0) return mask;
 
     apFrame++;
+
+    // MELONDS_AP_NOINPUT: bring the transport up but never drive the ROM - no
+    // button presses, no wireless activation, no movement patterns.  Lets a
+    // harness verify the lobby (relay handshake, role assignment, roster) with
+    // the game left sitting at the title screen.
+    static int apNoInput = -1;
+    if (apNoInput < 0) apNoInput = getenv("MELONDS_AP_NOINPUT") ? 1 : 0;
+    if (apNoInput) return mask;
 
     // ---- transport bring-up ----
     // The mailbox bridge now rides a direct TCP MpNet (the SAME wire protocol
@@ -626,6 +639,203 @@ namespace mpnet
 const int PORT = 7820;
 const melonDS::u32 MAXFRAME = 8192;
 
+// Bridge wire protocol version.  Advertised by the LAN discovery beacon (the
+// byte after "PLATMP") and sent to the online relay, which refuses to splice a
+// joiner whose version differs from the host's.  ONE constant: the beacon and
+// the relay hello must never disagree.
+const melonDS::u8 WIREVER = 1;
+
+// ---------------------------------------------------------------------------
+// Online relay client (PMRELAY1, contract in tools/relay/RELAY_PROTOCOL.md).
+// Instead of listening on :7820 and hoping the player's router and firewall
+// cooperate, both sides dial OUT to a neutral relay that splices their streams:
+// no port forwarding, and neither player sees the other's IP.  After the short
+// ASCII handshake the socket is byte-for-byte a LAN socket, so everything below
+// this layer (framing, roles, host relay of client bundles) is untouched.
+//
+//   host:   control connection  "PMRELAY1 HOST <ver> <name>"  -> "OK <CODE>",
+//           then "JOIN <ticket>" / "PING" for the session's life; each ticket
+//           gets a fresh accept connection that lands in a normal peer slot.
+//   joiner: "PMRELAY1 JOIN <CODE> <ver> <name>" -> "OK", and that same socket
+//           IS the host link.
+//
+// Env harness (see RELAY_PROTOCOL.md): MELONDS_AP_RELAY=<host[:port]> turns
+// MELONDS_AP=host|join into an online session, MELONDS_AP_CODE=<code> joins a
+// known room, MELONDS_AP_CODEFILE=<path> lets the host publish its code to a
+// file that a joiner polls.  Without MELONDS_AP_RELAY nothing changes.
+// ---------------------------------------------------------------------------
+const int RELAY_PORT = MpOnlineDefaultPort;
+const melonDS::u32 RELAY_RETRY_MS = 6000;    // protocol floor is 5 s
+const melonDS::u32 RELAY_HS_MS = 20000;      // no reply to a hello: redial
+const melonDS::u32 RELAY_MAXLINE = 200;
+
+// UI handoff.  The Qt thread posts a request and polls the status; the
+// emulation thread consumes the request in its bridge pump and republishes the
+// status there.  Both are tiny, so one mutex costs nothing.
+std::mutex gUiMx;
+struct UiRequest
+{
+    int want = 0;                   // 0 none, 1 host, 2 join, 3 stop
+    sockaddr_in addr = {};
+    char disp[96] = "";
+    char name[40] = "";
+    char code[8] = "";
+};
+UiRequest gUiReq;
+MpOnlineStatus gUiStatus;
+
+void setStr(char* dst, size_t cap, const char* src)
+{
+    if (!src) src = "";
+    size_t n = strlen(src);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, src, n);
+    dst[n] = 0;
+}
+template<size_t N> void setStr(char (&dst)[N], const char* src) { setStr(dst, N, src); }
+
+void setNonBlock(SOCKET s)
+{
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+    BOOL nd = TRUE; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
+}
+
+enum { RL_DEAD = 0, RL_CONNECTING, RL_HANDSHAKE, RL_UP };
+
+// One outbound relay connection during (and just after) its handshake.  All
+// three connection types share it; the joiner and accept links hand their
+// socket AND their leftover bytes to a peer slot the moment "OK" lands.
+struct RelayLink
+{
+    SOCKET s = INVALID_SOCKET;
+    int st = RL_DEAD;
+    std::string out;                    // handshake bytes still to send
+    std::vector<melonDS::u8> in;        // read but not yet consumed as a line
+    melonDS::u32 startMs = 0;
+    bool closed = false;                // relay hung up; buffered lines still count
+
+    void close()
+    {
+        if (s != INVALID_SOCKET) closesocket(s);
+        s = INVALID_SOCKET; st = RL_DEAD; out.clear(); in.clear(); closed = false;
+    }
+
+    bool hasLine() const
+    {
+        return std::find(in.begin(), in.end(), (melonDS::u8)'\n') != in.end();
+    }
+
+    // Hands the live socket to a peer slot: this link goes dead WITHOUT
+    // closing it.  Copy `in` out first (leftover-buffer rule).
+    SOCKET release() { SOCKET r = s; s = INVALID_SOCKET; close(); return r; }
+
+    bool begin(const sockaddr_in& addr, const char* hello, melonDS::u32 nowMs)
+    {
+        close();
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET) return false;
+        setNonBlock(s);
+        out = hello;
+        startMs = nowMs;
+        int r = ::connect(s, (const sockaddr*)&addr, sizeof(addr));
+        if (r == 0) st = RL_HANDSHAKE;
+        else if (WSAGetLastError() == WSAEWOULDBLOCK) st = RL_CONNECTING;
+        else { close(); return false; }
+        return true;
+    }
+
+    // false = the link died; the caller decides retry vs terminal.  Bounded
+    // per-frame work, never blocks (the emulation thread runs this).
+    bool pump()
+    {
+        if (st == RL_DEAD) return false;
+        if (st == RL_CONNECTING)
+        {
+            fd_set wr, ex; FD_ZERO(&wr); FD_ZERO(&ex);
+            FD_SET(s, &wr); FD_SET(s, &ex);
+            timeval tv = {0, 0};
+            int r = select(0, NULL, &wr, &ex, &tv);
+            if (r > 0 && FD_ISSET(s, &ex)) return false;
+            if (r > 0 && FD_ISSET(s, &wr)) st = RL_HANDSHAKE;
+            else return true;
+        }
+        if (!out.empty())
+        {
+            int r = ::send(s, out.data(), (int)out.size(), 0);
+            if (r > 0) out.erase(0, r);
+            else if (r == SOCKET_ERROR && WSAGetLastError() != WSAEWOULDBLOCK) return false;
+        }
+        char tmp[8192];
+        for (;;)
+        {
+            int r = ::recv(s, tmp, sizeof(tmp), 0);
+            if (r > 0)
+            {
+                in.insert(in.end(), tmp, tmp + r);
+                if (in.size() > 256*1024) return false;
+            }
+            else if (r == 0) { closed = true; break; }  // relay hung up
+            else
+            {
+                if (WSAGetLastError() != WSAEWOULDBLOCK) closed = true;
+                break;
+            }
+        }
+        // A terminal "ERR <token>" and the close that follows it routinely land
+        // in ONE segment.  Reporting the link dead here, before the caller has
+        // read that line, would turn every terminal error into a plain dropout
+        // and retry forever against a room that will never exist.  Hold the
+        // death back until the buffer has no complete line left.
+        if (closed && !hasLine()) return false;
+        return true;
+    }
+
+    // Pops one '\n'-terminated reply line.  Bytes past that '\n' STAY in `in`:
+    // on a joiner or accept link they are the first game-stream bytes (the
+    // relay's OK and the host's opening frame routinely share one segment) and
+    // the caller must carry them into the peer receive buffer.  Dropping them
+    // corrupts the very first length-framed frame.
+    bool takeLine(std::string& line)
+    {
+        for (size_t i = 0; i < in.size(); i++)
+        {
+            if (in[i] != '\n') continue;
+            size_t e = i;
+            if (e && in[e-1] == '\r') e--;
+            line.assign((const char*)in.data(), e);
+            in.erase(in.begin(), in.begin() + i + 1);
+            return true;
+        }
+        return false;
+    }
+
+    bool overflow() const
+    {
+        return in.size() > RELAY_MAXLINE
+            && std::find(in.begin(), in.end(), (melonDS::u8)'\n') == in.end();
+    }
+};
+
+// Retry policy from the protocol doc: these are the player's problem, not a
+// transient, so we stop and say why instead of hammering the relay.
+bool relayErrTerminal(const char* tok)
+{
+    return !strcmp(tok, "NOROOM") || !strcmp(tok, "VERSION")
+        || !strcmp(tok, "FULL")   || !strcmp(tok, "BADREQ");
+}
+
+const char* relayErrText(const char* tok)
+{
+    if (!strcmp(tok, "NOROOM"))  return "no room with that code";
+    if (!strcmp(tok, "VERSION")) return "the host runs a different version";
+    if (!strcmp(tok, "FULL"))    return "the room is full";
+    if (!strcmp(tok, "BADREQ"))  return "the relay rejected the request";
+    if (!strcmp(tok, "RATE"))    return "relay is rate limiting, retrying";
+    if (!strcmp(tok, "TIMEOUT")) return "the host did not answer, retrying";
+    if (!strcmp(tok, "CLOSED"))  return "the room closed, retrying";
+    return "relay error, retrying";
+}
+
 #ifdef _WIN32
 // Windows Firewall helper for hosting (same scheme as the DeSmuME fork's
 // mp_bridge.cpp).  Router port-forwarding alone can't make a host reachable:
@@ -716,6 +926,8 @@ struct Peer
 {
     SOCKET s = INVALID_SOCKET;
     bool up = false;
+    bool reserved = false;      // online host: an accept connection is in flight
+                                // for this slot, so a second ticket picks another
     std::vector<melonDS::u8> rx, tx;
 };
 
@@ -734,18 +946,207 @@ struct Net
     melonDS::u32 retryAt = 0;
     int assignedRole = 0;               // join: role handed out by the host
 
+    // ---- online relay session (0 = plain LAN transport, unchanged) ----
+    int online = 0;                     // 0 off, 1 host via relay, 2 join via relay
+    sockaddr_in relayAddr = {};         // resolved once, never in the frame loop
+    char relaySrv[96] = "";             // "host:port" as the player typed it
+    char roomCode[8] = "";              // host: assigned by the relay; join: target
+    char lobbyName[40] = "Player";
+    char codeFile[512] = "";
+    char onlineMsg[128] = "";           // connection state / last error, for the UI
+    bool onlineFatal = false;           // terminal error: stop, do not hammer the relay
+    melonDS::u32 onlineRetryMs = 0;
+    melonDS::u32 onlineLogMs = 0;
+    melonDS::u32 ctlSeenMs = 0;         // last line from the relay control link
+    bool codeWait = false;              // joiner: polling MELONDS_AP_CODEFILE
+    melonDS::u32 codePollMs = 0;
+    RelayLink ctl;                      // host control connection
+    RelayLink jlink;                    // joiner connection (becomes peers[0])
+    struct AcceptLink { RelayLink l; int slot = -1; int ticket = 0; };
+    AcceptLink acc[3];
+
+    // ---- lobby control frames (shared with the DeSmuME and BizHawk forks) ----
+    //   name: [0xFE][role][ping u16 LE][len u8][name]   ping: [0xFD][role][tick u32 LE]
+    //   pong: [0xFC][role][tick u32 LE]  (the receiver echoes a ping straight back)
+    // These ride the same length-framed stream as the game bundles but carry no
+    // game data, so they flow from the moment a link comes up: the roster is
+    // known in the lobby, long before anyone activates Wireless Play.
+    char myName[24] = "Player";
+    bool nameSet = false;
+    char rname[5][24] = {{0}};          // display name by role (1..4)
+    melonDS::u16 rping[5] = {0};        // that role's ping to the host, ms
+    melonDS::u16 myPingMs = 0;
+    melonDS::u32 pingSentAt = 0;
+    melonDS::u32 pongRx = 0;            // pongs the host answered
+    melonDS::u32 lastNameF = 0, lastPingF = 0;
+    melonDS::u32 lobbySeen[5] = {0,0,0,0,0};    // LOBBY presence, by role.
+                                    // Deliberately NOT the ROM-visible peer mask:
+                                    // gBr.roleSeenAt stays game-bundle-only, so a
+                                    // peer idling in the lobby cannot make the game
+                                    // flash "wireless connected" (the two-tier split
+                                    // the DeSmuME bridge documents).
+
     int myRole() const { return (mode == 1) ? 1 : (assignedRole ? assignedRole : 2); }
     bool anyUp() const { for (int i=0;i<3;i++) if (peers[i].up) return true; return false; }
+    int upCount() const { int n=0; for (int i=0;i<3;i++) if (peers[i].up) n++; return n; }
 
-    static void setNonBlock(SOCKET s)
+    void setMsg(const char* m) { setStr(onlineMsg, m); }
+
+    void setName(const char* nm)
     {
-        u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
-        BOOL nd = TRUE; setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nd, sizeof(nd));
+        if (nm && nm[0]) { setStr(myName, nm); nameSet = true; }
+    }
+
+    // Falls back to the PC name, matching what the LAN beacon advertises.
+    void ensureName()
+    {
+        if (nameSet) return;
+        nameSet = true;
+        const char* e = getenv("MELONDS_AP_NAME");
+        if (e && e[0]) { setStr(myName, e); return; }
+        char nm[24]; DWORD n = 24;
+        if (GetComputerNameA(nm, &n)) setStr(myName, nm);
+    }
+
+    void sendName(int role)
+    {
+        melonDS::u8 buf[29];
+        int nl = (int)strlen(myName); if (nl > 23) nl = 23;
+        buf[0] = 0xFE; buf[1] = (melonDS::u8)role;
+        buf[2] = (melonDS::u8)(myPingMs & 0xFF); buf[3] = (melonDS::u8)(myPingMs >> 8);
+        buf[4] = (melonDS::u8)nl;
+        memcpy(buf + 5, myName, nl);
+        sendAll(buf, 5 + nl);
+        if (role >= 1 && role <= 4)
+        {
+            memcpy(rname[role], myName, nl); rname[role][nl] = 0;
+            rping[role] = myPingMs;
+        }
+    }
+
+    void sendPing(int role)     // clients measure their ping to the host
+    {
+        if (mode != 2 || !peers[0].up) return;
+        pingSentAt = GetTickCount();
+        melonDS::u8 buf[6] = { 0xFD, (melonDS::u8)role,
+            (melonDS::u8)(pingSentAt & 0xFF), (melonDS::u8)((pingSentAt >> 8) & 0xFF),
+            (melonDS::u8)((pingSentAt >> 16) & 0xFF), (melonDS::u8)((pingSentAt >> 24) & 0xFF) };
+        enqueue(0, buf, 6);
+    }
+
+    // Handles the control frames and says whether it swallowed one.  Callers
+    // MUST consult this before the game-bundle path: a name frame reaching that
+    // path would be read as tag 0xFE with the ping bytes as its size and would
+    // stamp the peer game-active from the lobby.
+    bool handleCtlFrame(int pi, const melonDS::u8* rx, melonDS::u32 n, int role)
+    {
+        if (n == 2 && rx[0] == 0xFF)                    // host-assigned role
+        {
+            if (assignedRole != rx[1])
+            {
+                printf("[BR] host assigned role %d\n", rx[1]);
+                fflush(stdout);
+            }
+            assignedRole = rx[1];
+            sendName(myRole());                         // announce ourselves at once
+            return true;
+        }
+        if (n == 6 && rx[0] == 0xFD)                    // ping: echo it back as a pong
+        {
+            melonDS::u8 pong[6]; memcpy(pong, rx, 6); pong[0] = 0xFC;
+            enqueue(pi, pong, 6);
+            return true;
+        }
+        if (n == 6 && rx[0] == 0xFC)                    // pong: round trip is our ping
+        {
+            melonDS::u32 tick = rx[2] | (rx[3] << 8) | (rx[4] << 16) | ((melonDS::u32)rx[5] << 24);
+            melonDS::u32 rtt = GetTickCount() - tick;
+            myPingMs = (rtt > 9999) ? 9999 : (melonDS::u16)rtt;
+            pongRx++;
+            return true;
+        }
+        if (n >= 5 && rx[0] == 0xFE)                    // lobby name announce
+        {
+            int r = rx[1];
+            melonDS::u16 png = (melonDS::u16)(rx[2] | (rx[3] << 8));
+            int nl = rx[4];
+            if (r >= 1 && r <= 4 && nl <= 23 && n >= (melonDS::u32)(5 + nl))
+            {
+                bool isNew = (lobbySeen[r] == 0) || strncmp(rname[r], (const char*)rx + 5, nl) != 0;
+                memcpy(rname[r], rx + 5, nl); rname[r][nl] = 0;
+                rping[r] = png;
+                lobbySeen[r] = GetTickCount();
+                if (isNew)
+                {
+                    printf("[BR] lobby name: role %d = \"%s\" (ping %u ms)\n", r, rname[r], png);
+                    fflush(stdout);
+                }
+                // Host relay: a client's name reaches only us, so pass it on or
+                // the other clients never learn who else is in the room.
+                if (myRole() == 1)
+                    for (int pj = 0; pj < 3; pj++)
+                        if (pj != pi) enqueue(pj, rx, n);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    // Peeks the queued head frame without consuming it.  0 = nothing complete.
+    melonDS::u32 peekFrame(int i, melonDS::u8& tag) const
+    {
+        const Peer& p = peers[i];
+        if (p.rx.size() < 2) return 0;
+        melonDS::u32 n = (melonDS::u32)p.rx[0] | ((melonDS::u32)p.rx[1] << 8);
+        if (n == 0 || n > MAXFRAME) return 0;       // recvFrame drops the peer
+        if (p.rx.size() < 2 + n) return 0;
+        tag = p.rx[2];
+        return n;
+    }
+
+    // Lobby-level drain, run every frame from tick().  The ROM-side pump only
+    // runs once the ROM has published its bridge block (title screen: never), so
+    // without this the roster and the role assignment would wait on the game.
+    // Stops at the first game bundle: those belong to the ROM pump, which
+    // handles control frames too once it is running.
+    void drainControl(int pi)
+    {
+        for (int guard = 0; guard < 32; guard++)
+        {
+            melonDS::u8 tag = 0;
+            melonDS::u32 n = peekFrame(pi, tag);
+            if (!n || n > 64) return;
+            if (tag != 0xFF && tag != 0xFE && tag != 0xFD && tag != 0xFC) return;
+            melonDS::u8 buf[64];
+            melonDS::u32 got = recvFrame(pi, buf, sizeof(buf));
+            if (!got) return;
+            handleCtlFrame(pi, buf, got, myRole());
+        }
+    }
+
+    // Announce our name twice a second while linked, and (as a client) measure
+    // the ping to the host on the same cadence.  Cheap, and it keeps a roster
+    // fresh across reconnects without any join/leave bookkeeping.
+    void lobbyTick(melonDS::u32 frame)
+    {
+        for (int i = 0; i < 3; i++) drainControl(i);
+        if (!anyUp()) return;
+        if ((mode == 1 || assignedRole) && frame - lastNameF >= 30)
+        {
+            lastNameF = frame;
+            sendName(myRole());
+        }
+        if (mode == 2 && frame - lastPingF >= 30)
+        {
+            lastPingF = frame;
+            sendPing(myRole());
+        }
     }
 
     void startHost()
     {
         ensureFirewall();
+        ensureName();
         WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
         mode = 1; started = true;
         listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -764,9 +1165,54 @@ struct Net
 
     void startJoin(const char* ip)
     {
+        ensureName();
         WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
         if (ip && ip[0]) { strncpy(joinIP, ip, sizeof(joinIP)-1); joinIP[sizeof(joinIP)-1] = 0; }
         mode = 2; started = true;
+    }
+
+    // Online host.  Deliberately does NOT bind, listen, beacon or touch the
+    // firewall helper: this session is outbound-only, so an inbound rule would
+    // buy nothing and a LAN advert would point peers at a port nobody serves.
+    void startHostOnline(const sockaddr_in& addr, const char* disp, const char* name)
+    {
+        WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+        mode = 1; online = 1; started = true;
+        relayAddr = addr;
+        setStr(relaySrv, disp);
+        if (name && name[0]) setStr(lobbyName, name);
+        setName(lobbyName); ensureName();
+        roomCode[0] = 0; onlineFatal = false; onlineRetryMs = 0;
+        setMsg("connecting to the relay...");
+        printf("[BR] online host: relay %s, name \"%s\", wire ver %d\n",
+            relaySrv, lobbyName, (int)WIREVER);
+        fflush(stdout);
+    }
+
+    void startJoinOnline(const sockaddr_in& addr, const char* disp,
+                         const char* code, const char* name)
+    {
+        WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+        mode = 2; online = 2; started = true;
+        relayAddr = addr;
+        setStr(relaySrv, disp);
+        if (name && name[0]) setStr(lobbyName, name);
+        setName(lobbyName); ensureName();
+        onlineFatal = false; onlineRetryMs = 0;
+        roomCode[0] = 0;
+        if (code && code[0]) { setStr(roomCode, code); upperCode(); }
+        codeWait = !roomCode[0];
+        codePollMs = 0;
+        setMsg(codeWait ? "waiting for the host's room code" : "connecting...");
+        printf("[BR] online join: relay %s, room %s, name \"%s\"\n",
+            relaySrv, roomCode[0] ? roomCode : "(from code file)", lobbyName);
+        fflush(stdout);
+    }
+
+    void upperCode()
+    {
+        for (char* p = roomCode; *p; p++)
+            if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 'a' + 'A');
     }
 
     // LAN discovery beacon (UDP :7821, shared cross-emulator format) so a
@@ -776,6 +1222,7 @@ struct Net
     void beaconTick(melonDS::u32 frame, melonDS::u8 players)
     {
         if (mode != 1) return;
+        if (online) return;     // relayed room: no LAN peer could use this advert
         if (beaconTx == INVALID_SOCKET)
         {
             beaconTx = socket(AF_INET, SOCK_DGRAM, 0);
@@ -785,7 +1232,7 @@ struct Net
         if (frame - lastBeacon < 60) return;
         lastBeacon = frame;
         melonDS::u8 buf[32]; memset(buf, 0, sizeof(buf));
-        memcpy(buf, "PLATMP", 6); buf[6] = 1; buf[7] = players;
+        memcpy(buf, "PLATMP", 6); buf[6] = WIREVER; buf[7] = players;
         char nm[24]; DWORD n = 24; if (!GetComputerNameA(nm, &n)) { strcpy(nm, "melonDS"); n = 7; }
         memcpy(buf + 8, nm, (n < 24) ? n : 23);
         sockaddr_in a; memset(&a, 0, sizeof(a));
@@ -797,8 +1244,32 @@ struct Net
     {
         started = true;
         const char* e = getenv("MELONDS_AP");
-        if (e && !strcmp(e, "host")) startHost();
-        else if (e && !strcmp(e, "join")) startJoin(getenv("MELONDS_AP_IP"));
+        if (!e) { mode = 0; return; }
+
+        // MELONDS_AP_RELAY turns the harness roles into an online session.
+        // Absent, everything below behaves exactly as it always has.
+        const char* relay = getenv("MELONDS_AP_RELAY");
+        if (relay && relay[0])
+        {
+            setStr(codeFile, getenv("MELONDS_AP_CODEFILE"));
+            const char* nm = getenv("MELONDS_AP_NAME");
+            MpOnlineTarget t;
+            if (!MpOnlineResolve(relay, RELAY_PORT, &t))
+            {
+                printf("[BR] online: cannot resolve relay \"%s\"\n", relay);
+                fflush(stdout);
+                mode = 0;
+                return;
+            }
+            sockaddr_in a; memcpy(&a, t.addr, sizeof(a));
+            if (!strcmp(e, "host")) startHostOnline(a, t.disp, nm);
+            else if (!strcmp(e, "join")) startJoinOnline(a, t.disp, getenv("MELONDS_AP_CODE"), nm);
+            else mode = 0;
+            return;
+        }
+
+        if (!strcmp(e, "host")) startHost();
+        else if (!strcmp(e, "join")) startJoin(getenv("MELONDS_AP_IP"));
         else mode = 0;
     }
 
@@ -806,14 +1277,364 @@ struct Net
     {
         Peer& p = peers[i];
         if (p.s != INVALID_SOCKET) closesocket(p.s);
-        p.s = INVALID_SOCKET; p.up = false; p.rx.clear(); p.tx.clear();
+        p.s = INVALID_SOCKET; p.up = false; p.reserved = false;
+        p.rx.clear(); p.tx.clear();
         if (mode == 2) connecting = false;
+        if (online == 2 && i == 0)
+        {
+            // Relayed link died: redial the room after the protocol's backoff.
+            onlineRetryMs = SDL_GetTicks() + RELAY_RETRY_MS;
+            setMsg("link lost, reconnecting");
+            printf("[BR] online join: link lost, redialling room %s\n", roomCode);
+            fflush(stdout);
+        }
+    }
+
+    // ---- online relay state machines ---------------------------------------
+
+    void writeCodeFile()
+    {
+        if (!codeFile[0] || !roomCode[0]) return;
+        FILE* f = fopen(codeFile, "wb");
+        if (!f) { printf("[BR] online: cannot write code file %s\n", codeFile); fflush(stdout); return; }
+        fprintf(f, "%s\n", roomCode);
+        fclose(f);
+        printf("[BR] online: wrote code %s to %s\n", roomCode, codeFile);
+        fflush(stdout);
+    }
+
+    bool readCodeFile()
+    {
+        if (!codeFile[0]) return false;
+        FILE* f = fopen(codeFile, "rb");
+        if (!f) return false;
+        char b[32] = {0};
+        size_t n = fread(b, 1, sizeof(b)-1, f);
+        fclose(f);
+        char c[8]; size_t k = 0;
+        for (size_t i = 0; i < n && k < 5; i++)
+        {
+            char ch = b[i];
+            if (ch == ' ' || ch == '\r' || ch == '\n' || ch == '\t') continue;
+            c[k++] = (ch >= 'a' && ch <= 'z') ? (char)(ch - 'a' + 'A') : ch;
+        }
+        if (k < 5) return false;
+        c[5] = 0;
+        setStr(roomCode, c);
+        return true;
+    }
+
+    // Applies an "ERR <token>" reply.  Terminal tokens stop the session with a
+    // reason the player can act on; the rest get the >= 5 s backoff.
+    void applyErr(const char* tok, melonDS::u32 now, const char* who)
+    {
+        char m[128];
+        snprintf(m, sizeof(m), "%s", relayErrText(tok));
+        setMsg(m);
+        if (relayErrTerminal(tok))
+        {
+            onlineFatal = true;
+            printf("[BR] online %s: %s (ERR %s) - stopping\n", who, m, tok);
+        }
+        else
+        {
+            onlineRetryMs = now + RELAY_RETRY_MS;
+            printf("[BR] online %s: %s (ERR %s)\n", who, m, tok);
+        }
+        fflush(stdout);
+    }
+
+    void startAccept(int tid, melonDS::u32 now)
+    {
+        int slot = -1, ai = -1;
+        for (int i = 0; i < 3; i++)
+            if (!peers[i].up && !peers[i].reserved) { slot = i; break; }
+        for (int i = 0; i < 3; i++)
+            if (acc[i].l.st == RL_DEAD) { ai = i; break; }
+        if (slot < 0 || ai < 0)
+        {
+            // No free peer slot: leave the ticket unclaimed on purpose.  The
+            // relay expires it and tells that joiner TIMEOUT.
+            printf("[BR] online host: ticket %d ignored, no free slot\n", tid);
+            fflush(stdout);
+            return;
+        }
+        char hello[128];
+        snprintf(hello, sizeof(hello), "PMRELAY1 ACCEPT %s %d\n", roomCode, tid);
+        if (!acc[ai].l.begin(relayAddr, hello, now)) return;
+        acc[ai].slot = slot; acc[ai].ticket = tid;
+        peers[slot].reserved = true;
+        printf("[BR] online host: ticket %d -> accept connection (slot %d, role %d)\n",
+            tid, slot, 2 + slot);
+        fflush(stdout);
+    }
+
+    // Spliced: hand the socket to the peer slot exactly as accept() would have,
+    // leftover handshake bytes and role assignment frame included.
+    void installLink(RelayLink& l, int i)
+    {
+        Peer& p = peers[i];
+        p.rx.assign(l.in.begin(), l.in.end());      // leftover-buffer rule
+        p.tx.clear();
+        p.s = l.release();
+        p.up = true; p.reserved = false;
+        connecting = false;
+        freshPeer = true;
+    }
+
+    void acceptTick(int i, melonDS::u32 now)
+    {
+        AcceptLink& a = acc[i];
+        if (a.l.st == RL_DEAD) return;
+        bool bad = !a.l.pump() || a.l.overflow();
+        if (!bad && a.l.st != RL_UP && now - a.l.startMs > RELAY_HS_MS)
+        {
+            printf("[BR] online host: ticket %d accept timed out\n", a.ticket);
+            fflush(stdout);
+            bad = true;
+        }
+        std::string line;
+        if (!bad && a.l.takeLine(line))
+        {
+            char v[32] = {0}, t[64] = {0};
+            sscanf(line.c_str(), "%31s %63s", v, t);
+            if (!strcmp(v, "OK"))
+            {
+                melonDS::u32 leftover = (melonDS::u32)a.l.in.size();
+                int slot = a.slot;
+                installLink(a.l, slot);
+                melonDS::u8 ctlf[4] = { 2, 0, 0xFF, (melonDS::u8)(2 + slot) };
+                peers[slot].tx.insert(peers[slot].tx.end(), ctlf, ctlf + 4);
+                flush(slot);
+                printf("[BR] peer accepted (online ticket %d) -> role %d (%u leftover byte(s))\n",
+                    a.ticket, 2 + slot, leftover);
+                fflush(stdout);
+                a.slot = -1; a.ticket = 0;
+                return;
+            }
+            printf("[BR] online host: ticket %d rejected (%s %s)\n", a.ticket, v, t);
+            fflush(stdout);
+            bad = true;
+        }
+        if (bad)
+        {
+            if (a.slot >= 0) peers[a.slot].reserved = false;
+            a.slot = -1;
+            a.l.close();
+        }
+    }
+
+    void hostOnlineTick(melonDS::u32 now)
+    {
+        for (int i = 0; i < 3; i++) acceptTick(i, now);
+
+        if (ctl.st == RL_DEAD)
+        {
+            if (onlineFatal || now < onlineRetryMs) return;
+            char hello[300];
+            snprintf(hello, sizeof(hello), "PMRELAY1 HOST %d %s\n", (int)WIREVER, lobbyName);
+            if (!ctl.begin(relayAddr, hello, now))
+            {
+                onlineRetryMs = now + RELAY_RETRY_MS;
+                setMsg("relay unreachable, retrying");
+                return;
+            }
+            roomCode[0] = 0;
+            ctlSeenMs = now;
+            setMsg("connecting to the relay...");
+            return;
+        }
+
+        bool bad = !ctl.pump() || ctl.overflow();
+        bool said = false;      // an ERR reply already explained itself
+        if (!bad && ctl.st != RL_UP && now - ctl.startMs > RELAY_HS_MS) bad = true;
+        // The relay pings every 30 s; prolonged silence means the room is gone
+        // even though the socket still looks alive (joiners would just time out).
+        if (!bad && ctl.st == RL_UP && now - ctlSeenMs > 120000) bad = true;
+        std::string line;
+        while (!bad && ctl.takeLine(line))
+        {
+            ctlSeenMs = now;
+            char v[32] = {0}, t[64] = {0};
+            sscanf(line.c_str(), "%31s %63s", v, t);
+            if (!strcmp(v, "OK") && t[0])
+            {
+                ctl.st = RL_UP;
+                setStr(roomCode, t);
+                char m[128];
+                snprintf(m, sizeof(m), "room code %s on %s", roomCode, relaySrv);
+                setMsg(m);
+                printf("[BR] online room code %s on %s\n", roomCode, relaySrv);
+                fflush(stdout);
+                writeCodeFile();
+            }
+            else if (!strcmp(v, "JOIN")) startAccept(atoi(t), now);
+            else if (!strcmp(v, "PING")) ctl.out += "PONG\n";
+            else if (!strcmp(v, "ERR"))
+            {
+                applyErr(t, now, "host");
+                bad = true; said = true;
+            }
+        }
+
+        if (bad)
+        {
+            ctl.close();
+            roomCode[0] = 0;
+            if (!onlineFatal && !said)
+            {
+                onlineRetryMs = now + RELAY_RETRY_MS;
+                setMsg("relay link lost, reconnecting");
+                printf("[BR] online host: relay link lost, reconnecting\n");
+                fflush(stdout);
+            }
+        }
+    }
+
+    void joinOnlineTick(melonDS::u32 now)
+    {
+        if (codeWait)
+        {
+            if (now < codePollMs) return;
+            codePollMs = now + 1000;            // about once a second
+            if (!readCodeFile()) return;
+            codeWait = false;
+            setMsg("connecting...");
+            printf("[BR] online join: room code %s read from %s\n", roomCode, codeFile);
+            fflush(stdout);
+        }
+        if (peers[0].up) return;                // spliced: normal joiner behaviour
+
+        if (jlink.st == RL_DEAD)
+        {
+            if (onlineFatal || now < onlineRetryMs) return;
+            char hello[300];
+            snprintf(hello, sizeof(hello), "PMRELAY1 JOIN %s %d %s\n",
+                roomCode, (int)WIREVER, lobbyName);
+            if (!jlink.begin(relayAddr, hello, now))
+            {
+                onlineRetryMs = now + RELAY_RETRY_MS;
+                setMsg("relay unreachable, retrying");
+                return;
+            }
+            char m[128]; snprintf(m, sizeof(m), "room %s (connecting...)", roomCode);
+            setMsg(m);
+            printf("[BR] online join: dialling room %s via %s\n", roomCode, relaySrv);
+            fflush(stdout);
+            return;
+        }
+
+        bool bad = !jlink.pump() || jlink.overflow();
+        bool said = false;
+        if (!bad && now - jlink.startMs > RELAY_HS_MS)
+        {
+            setMsg("the relay did not answer, retrying");
+            printf("[BR] online join: no reply from the relay, retrying\n");
+            fflush(stdout);
+            bad = true;
+        }
+        std::string line;
+        if (!bad && jlink.takeLine(line))
+        {
+            char v[32] = {0}, t[64] = {0};
+            sscanf(line.c_str(), "%31s %63s", v, t);
+            if (!strcmp(v, "OK"))
+            {
+                melonDS::u32 leftover = (melonDS::u32)jlink.in.size();
+                installLink(jlink, 0);
+                char m[128]; snprintf(m, sizeof(m), "room %s (connected)", roomCode);
+                setMsg(m);
+                printf("[BR] online join: spliced into room %s (%u leftover byte(s))\n",
+                    roomCode, leftover);
+                fflush(stdout);
+                return;
+            }
+            if (!strcmp(v, "ERR")) { applyErr(t, now, "join"); said = true; }
+            bad = true;
+        }
+        if (bad)
+        {
+            jlink.close();
+            if (!onlineFatal && !said) onlineRetryMs = now + RELAY_RETRY_MS;
+        }
+    }
+
+    void onlineTick()
+    {
+        melonDS::u32 now = SDL_GetTicks();
+        if (online == 1) hostOnlineTick(now);
+        else if (online == 2) joinOnlineTick(now);
+
+        // Low-rate liveness line: the lobby state is worth seeing even before
+        // the ROM publishes its bridge block (which gates the pump's own log).
+        if (now - onlineLogMs >= 10000)
+        {
+            onlineLogMs = now;
+            // A joiner that has not reached the ROM's bridge block yet still
+            // holds the host's role frame in its receive buffer; show it, so
+            // "the host assigned me role N" is visible at lobby level too.
+            const Peer& p0 = peers[0];
+            int pendRole = (online == 2 && p0.rx.size() >= 4
+                && p0.rx[0] == 2 && p0.rx[1] == 0 && p0.rx[2] == 0xFF) ? p0.rx[3] : 0;
+            printf("[BR] online %s: room %s, state \"%s\", links=%d, pendingRole=%d, pongs=%u\n",
+                (online == 1) ? "host" : "join",
+                roomCode[0] ? roomCode : "-", onlineMsg, upCount(), pendRole, pongRx);
+            printf("[BR] lobby roster (me = role %d):", myRole());
+            for (int r = 1; r <= 4; r++)
+                if (rname[r][0]) printf(" [%d]\"%s\" %ums", r, rname[r], rping[r]);
+            printf("\n");
+            fflush(stdout);
+        }
+
+        publishStatus();
+    }
+
+    void publishStatus()
+    {
+        std::lock_guard<std::mutex> lk(gUiMx);
+        gUiStatus.mode = online;
+        gUiStatus.peers = upCount();
+        gUiStatus.pending = (gUiReq.want != 0);
+        setStr(gUiStatus.code, roomCode);
+        setStr(gUiStatus.server, relaySrv);
+        setStr(gUiStatus.text, onlineMsg);
+        gUiStatus.myRole = myRole();
+        for (int r = 1; r <= 4; r++)
+        {
+            setStr(gUiStatus.roster[r], rname[r]);
+            gUiStatus.rosterPing[r] = rping[r];
+        }
+    }
+
+    // Picks up a start/stop request posted by the Qt thread.  Runs before the
+    // LAN-follow logic, so an online session always wins while it is active.
+    void pollRequest()
+    {
+        UiRequest r;
+        {
+            std::lock_guard<std::mutex> lk(gUiMx);
+            if (!gUiReq.want) return;
+            r = gUiReq;
+            gUiReq.want = 0;
+        }
+        shutdown();
+        started = true;
+        if (r.want == 1) startHostOnline(r.addr, r.disp, r.name);
+        else if (r.want == 2) startJoinOnline(r.addr, r.disp, r.code, r.name);
+        else
+        {
+            setMsg("");
+            printf("[BR] online: session stopped\n");
+            fflush(stdout);
+        }
+        publishStatus();
     }
 
     void tick(melonDS::u32 frame)
     {
         if (mode == 0) return;
-        if (mode == 1 && listener != INVALID_SOCKET)
+        if (online) onlineTick();
+        else if (mode == 1 && listener != INVALID_SOCKET)
         {
             for (int i = 0; i < 3; i++)
             {
@@ -854,6 +1675,7 @@ struct Net
             }
         }
         for (int i = 0; i < 3; i++) { flush(i); pumpRecv(i); }
+        lobbyTick(frame);
     }
 
     void enqueue(int i, const melonDS::u8* p, melonDS::u32 n)
@@ -906,9 +1728,14 @@ struct Net
 
     void shutdown()
     {
+        online = 0;                 // before dropPeer: no "redial the room" here
         for (int i=0;i<3;i++) dropPeer(i);
         if (beaconTx != INVALID_SOCKET) { closesocket(beaconTx); beaconTx = INVALID_SOCKET; }
         if (listener != INVALID_SOCKET) { closesocket(listener); listener = INVALID_SOCKET; }
+        ctl.close(); jlink.close();
+        for (int i=0;i<3;i++) { acc[i].l.close(); acc[i].slot = -1; acc[i].ticket = 0; }
+        roomCode[0] = 0; onlineFatal = false; onlineRetryMs = 0; codeWait = false;
+        assignedRole = 0;
         mode = 0;
     }
 };
@@ -953,6 +1780,7 @@ void BridgePump(melonDS::NDS* nds)
     using namespace melonDS;
     gBr.frame++;
 
+    mpnet::gNet.pollRequest();      // Host/Join Online Game... from the menu
     if (!mpnet::gNet.started) mpnet::gNet.startFromEnv();
     if (mpnet::gNet.mode == 0)
     {
@@ -1090,7 +1918,11 @@ void BridgePump(melonDS::NDS* nds)
         while ((n = mpnet::gNet.recvFrame(pi, rx, sizeof(rx))) > 0)
         {
             gBr.dbgRx++;
-            if (n == 2 && rx[0] == 0xFF) { mpnet::gNet.assignedRole = rx[1]; continue; }  // host-assigned role
+            // Control frames (role, lobby name, ping/pong) never carry game
+            // data and must be taken out BEFORE the bundle path below, which
+            // would otherwise read a name frame's ping bytes as a block size
+            // and stamp that peer game-active from the lobby.
+            if (mpnet::gNet.handleCtlFrame(pi, rx, n, myRole)) continue;
             if (n < 4) continue;
             int tag = rx[0], r = rx[1];
             u32 sz = (u32)(rx[2] | (rx[3] << 8));
@@ -1104,6 +1936,7 @@ void BridgePump(melonDS::NDS* nds)
                 for (int pj = 0; pj < 3; pj++)
                     if (pj != pi) mpnet::gNet.enqueue(pj, rx, n);
 
+            if (tag >= 1 && tag <= 3)
             {
                 // Peer NEWLY game-active (activated Wireless Play or
                 // reconnected): resend on-change channels — anything sent
@@ -1114,9 +1947,11 @@ void BridgePump(melonDS::NDS* nds)
                     gBr.lastParty.clear();
                     gBr.lastPkt.clear();
                 }
+                // Game-bundle presence ONLY: the ROM-visible peer mask must not
+                // count a player who is merely sitting in the lobby.
+                gBr.roleSeenAt[r] = gBr.frame;
+                sGameEver[r] = 1;   // latch: role has been game-active this session
             }
-            gBr.roleSeenAt[r] = gBr.frame;
-            sGameEver[r] = 1;   // latch: this role has been game-active this session
 
             // LEGACY-CHANNEL PAIR ROUTING (3+ players): the single pairwise
             // import block / party buffer only accepts the CHOSEN pair
@@ -1278,6 +2113,95 @@ void BridgePump(melonDS::NDS* nds)
 
 }
 // ---------------------------------------------------------------------------
+
+
+// ---------------------------------------------------------------------------
+// Online relay control surface (MpOnline.h).  Called from the Qt thread; the
+// emulation thread picks the request up in its next bridge pump.
+// ---------------------------------------------------------------------------
+
+int MpOnlineWireVersion() { return (int)mpnet::WIREVER; }
+
+// Blocking DNS, on purpose: it runs once at click time (or once at env init),
+// never inside the frame loop.
+bool MpOnlineResolve(const char* server, int defPort, MpOnlineTarget* out)
+{
+    if (!server || !out) return false;
+    while (*server == ' ') server++;
+    if (!*server) return false;
+
+    char host[128];
+    mpnet::setStr(host, server);
+    for (int i = (int)strlen(host) - 1; i >= 0 && host[i] == ' '; i--) host[i] = 0;
+
+    int port = defPort;
+    char* colon = strrchr(host, ':');
+    if (colon && colon[1])
+    {
+        int p = atoi(colon + 1);
+        if (p > 0 && p < 65536) { port = p; *colon = 0; }
+    }
+    if (!host[0]) return false;
+
+    WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+
+    addrinfo hints = {};
+    hints.ai_family = AF_INET;              // the bridge speaks IPv4
+    hints.ai_socktype = SOCK_STREAM;
+    char portstr[16];
+    snprintf(portstr, sizeof(portstr), "%d", port);
+    addrinfo* res = nullptr;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0 || !res) return false;
+
+    sockaddr_in a = {};
+    memcpy(&a, res->ai_addr, sizeof(a));
+    freeaddrinfo(res);
+
+    memcpy(out->addr, &a, sizeof(a));
+    out->addrLen = (int)sizeof(a);
+    snprintf(out->disp, sizeof(out->disp), "%s:%d", host, port);
+    return true;
+}
+
+static void MpOnlinePost(int want, const MpOnlineTarget& t, const char* code, const char* name)
+{
+    std::lock_guard<std::mutex> lk(mpnet::gUiMx);
+    mpnet::gUiReq.want = want;
+    memcpy(&mpnet::gUiReq.addr, t.addr, sizeof(mpnet::gUiReq.addr));
+    mpnet::setStr(mpnet::gUiReq.disp, t.disp);
+    mpnet::setStr(mpnet::gUiReq.name, name);
+    mpnet::setStr(mpnet::gUiReq.code, code);
+    mpnet::gUiStatus.pending = true;
+    mpnet::gUiStatus.mode = (want == 3) ? 0 : want;
+    mpnet::setStr(mpnet::gUiStatus.server, t.disp);
+    mpnet::setStr(mpnet::gUiStatus.code, (want == 2) ? code : "");
+    mpnet::setStr(mpnet::gUiStatus.text,
+        (want == 3) ? "" : "starting (waiting for emulation)");
+}
+
+void MpOnlineHost(const MpOnlineTarget& t, const char* name)
+{
+    MpOnlinePost(1, t, "", name);
+}
+
+void MpOnlineJoin(const MpOnlineTarget& t, const char* code, const char* name)
+{
+    MpOnlinePost(2, t, code, name);
+}
+
+void MpOnlineStop()
+{
+    MpOnlineTarget t;
+    MpOnlinePost(3, t, "", "");
+}
+
+void MpOnlineGetStatus(MpOnlineStatus* out)
+{
+    if (!out) return;
+    std::lock_guard<std::mutex> lk(mpnet::gUiMx);
+    *out = mpnet::gUiStatus;
+}
+
 
 void EmuThread::run()
 {
