@@ -20,6 +20,15 @@ This is an in-progress community fork maintained by **M4doesstuff** and
 **Hermy**. Its goal is to make the Project PM multiplayer build of melonDS
 available as a native Linux x86_64 AppImage, rather than requiring Wine.
 
+### v1.3 Beta: online room-code multiplayer
+
+The current Linux prerelease, **Project PM Linux v1.3 Beta**, brings in the
+upstream room-code relay mode. It is the simplest way to play with someone
+over the internet: it needs no port forwarding or router configuration, and
+works even when either player is behind CGNAT. See [Hosting over the
+internet](#hosting-over-the-internet) for the Host Online Game / Join Online
+Game steps.
+
 Download the current native Linux build from the repository's
 [Releases](https://github.com/fdelavega02/melonDS-Project-PM/releases) page.
 On CachyOS, install `fuse2`, mark the AppImage executable, and launch it:
