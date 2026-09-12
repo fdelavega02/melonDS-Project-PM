@@ -23,8 +23,16 @@ This is an in-progress community fork maintained by **M4doesstuff** and
 **Hermy**. Its goal is to make the Project PM multiplayer build of melonDS
 available as a native Linux x86_64 AppImage, rather than requiring Wine.
 
-Download the current native Linux build from the repository's **Releases**
-page, mark the AppImage executable, and launch it:
+### v1.1.2 Beta: title-label maintenance release
+
+This maintenance build preserves v1.1.1's LAN/direct-IP Project PM
+multiplayer and adds an unambiguous Project PM release title to the title
+bar, About dialog, and terminal banner. The emulator base remains melonDS
+1.1.
+
+Download the current native Linux build from the repository's
+[Releases](https://github.com/fdelavega02/melonDS-Project-PM/releases) page,
+mark the AppImage executable, and launch it:
 
 ```sh
 chmod +x melonDS*.AppImage
