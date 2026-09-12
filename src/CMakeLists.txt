@@ -165,6 +165,17 @@ set(MELONDS_GIT_BRANCH "$ENV{MELONDS_GIT_BRANCH}" CACHE STRING "The Git branch u
 set(MELONDS_GIT_HASH "$ENV{MELONDS_GIT_HASH}" CACHE STRING "The hash of the Git commit")
 set(MELONDS_BUILD_PROVIDER "$ENV{MELONDS_BUILD_PROVIDER}" CACHE STRING "The name of the provider of this build")
 
+# Project PM releases are tagged as project-pm-linux-vX.Y[-beta].  Derive the
+# user-visible title from that tag so the AppImage title bar identifies the
+# release people actually downloaded instead of only the upstream melonDS 1.1
+# base version.  Non-release and upstream builds retain the normal title.
+set(MELONDS_WINDOW_TITLE "melonDS ${melonDS_VERSION}${MELONDS_VERSION_SUFFIX}")
+if (MELONDS_GIT_BRANCH MATCHES "^refs/tags/project-pm-linux-v")
+    string(REGEX REPLACE "^refs/tags/project-pm-linux-" "" MELONDS_PROJECT_PM_VERSION "${MELONDS_GIT_BRANCH}")
+    string(REPLACE "-" " " MELONDS_PROJECT_PM_VERSION "${MELONDS_PROJECT_PM_VERSION}")
+    set(MELONDS_WINDOW_TITLE "melonDS Project PM Linux ${MELONDS_PROJECT_PM_VERSION}")
+endif()
+
 if (MELONDS_EMBED_BUILD_INFO)
     target_compile_definitions(core PUBLIC MELONDS_EMBED_BUILD_INFO)
     if (NOT MELONDS_GIT_BRANCH OR NOT MELONDS_GIT_HASH OR NOT MELONDS_BUILD_PROVIDER)
@@ -242,4 +253,3 @@ endif()
 #    BEFORE PUBLIC -fsanitize=undefined PUBLIC -fsanitize=address
 #  )
 #endif()
-

@@ -20,14 +20,18 @@ This is an in-progress community fork maintained by **M4doesstuff** and
 **Hermy**. Its goal is to make the Project PM multiplayer build of melonDS
 available as a native Linux x86_64 AppImage, rather than requiring Wine.
 
-### v1.4 Beta: eight-player online room-code multiplayer
+### v1.4.1 Beta: eight-player online room-code multiplayer
 
-The current Linux prerelease, **Project PM Linux v1.4 Beta**, brings in the
+The current Linux prerelease, **Project PM Linux v1.4.1 Beta**, brings in the
 upstream eight-player expansion alongside room-code relay mode. It is the
 simplest way to play with a group over the internet: it needs no port
 forwarding or router configuration, and works even when players are behind
 CGNAT. See [Hosting over the internet](#hosting-over-the-internet) for the
 Host Online Game / Join Online Game steps.
+
+Release builds identify themselves in the title bar as **melonDS Project PM
+Linux vX.Y Beta**, so it is clear which Project PM build is running even
+though the emulator base remains melonDS 1.1.
 
 Download the current native Linux build from the repository's
 [Releases](https://github.com/fdelavega02/melonDS-Project-PM/releases) page.
