@@ -20,14 +20,14 @@ This is an in-progress community fork maintained by **M4doesstuff** and
 **Hermy**. Its goal is to make the Project PM multiplayer build of melonDS
 available as a native Linux x86_64 AppImage, rather than requiring Wine.
 
-### v1.3 Beta: online room-code multiplayer
+### v1.4 Beta: eight-player online room-code multiplayer
 
-The current Linux prerelease, **Project PM Linux v1.3 Beta**, brings in the
-upstream room-code relay mode. It is the simplest way to play with someone
-over the internet: it needs no port forwarding or router configuration, and
-works even when either player is behind CGNAT. See [Hosting over the
-internet](#hosting-over-the-internet) for the Host Online Game / Join Online
-Game steps.
+The current Linux prerelease, **Project PM Linux v1.4 Beta**, brings in the
+upstream eight-player expansion alongside room-code relay mode. It is the
+simplest way to play with a group over the internet: it needs no port
+forwarding or router configuration, and works even when players are behind
+CGNAT. See [Hosting over the internet](#hosting-over-the-internet) for the
+Host Online Game / Join Online Game steps.
 
 Download the current native Linux build from the repository's
 [Releases](https://github.com/fdelavega02/melonDS-Project-PM/releases) page.
@@ -93,9 +93,9 @@ and nobody sees anyone else's IP address.
 
 One player picks **Host Online Game...** in melonDS's Multiplayer menu. The
 relay server field comes pre-set to the community relay, so just click
-through: the emulator shows a 5 character room code. Share the code, and
-everyone else picks **Join Online Game...** and enters it. Both sides dial
-*out* to the relay, which splices the two connections together, so it works
+through: the emulator shows a 5 character room code. Share the code, and up
+to seven other players pick **Join Online Game...** and enter it. Both sides
+dial *out* to the relay, which splices the connections together, so it works
 from behind any normal router and from behind CGNAT. The room code stays on
 screen for the whole session.
 
